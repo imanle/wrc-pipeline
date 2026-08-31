@@ -185,11 +185,9 @@ class ScrapingSettings(BaseModel):
     base_url: str
     search_path: str
     decisions_flag: int = 1
-    date_input_format: str = "%-d/%-m/%Y"
     date_display_format: str = "%d/%m/%Y"
     body_param_separator: str = ","
-    # Pagination parameter name. Pending Phase 0 confirmation; overridable
-    # without touching code once the pager URL is known.
+    # Confirmed by recon: &pageNumber=2, 1-based, omitted for page 1.
     page_param: str = "pageNumber"
     result_count_pattern: str = (
         r"Shows\s+(\d+)\s+to\s+(\d+)\s+of\s+([\d,]+)\s+results"
@@ -282,6 +280,7 @@ class ScrapingSettings(BaseModel):
         # safe="/" keeps the d/M/yyyy slashes readable rather than %2F-encoded;
         # the site accepts both, and readable URLs make the logs debuggable.
         return f"{base}?{urlencode(params, safe='/')}"
+
     def safe_identifier(self, identifier: str) -> str:
         """Filesystem/object-key-safe form of a reference.
 
