@@ -11,15 +11,18 @@ storage), then transforms them into a curated zone.
 
 ## Prerequisites
 
-- Python 3.11+
+- **Python 3.11+** (3.12 recommended). macOS ships 3.9 as its system Python,
+  which is too old — `python3 --version` will tell you. Install a newer one with
+  `brew install python@3.12`.
 - Docker Desktop (running)
 
 ## Setup
 
 ```bash
-# 1. Virtual environment
-python3.11 -m venv .venv
+# 1. Virtual environment — use an explicit 3.11+ interpreter, not bare `python3`
+python3.12 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
+python --version                   # confirm 3.11+ before continuing
 
 # 2. Dependencies
 pip install --upgrade pip
@@ -39,9 +42,13 @@ MongoDB: `mongodb://wrc:wrc_password@localhost:27017/?authSource=admin`
 ## Verify the setup
 
 ```bash
-pytest                             # unit tests
+python -m pytest                   # unit tests
 python -c "from wrc_pipeline.settings import load_settings; print(load_settings().mongo.database)"
 ```
+
+> Use `python -m pytest` rather than bare `pytest`. A user-level pytest install
+> elsewhere on `PATH` can shadow the one in the venv and run under the wrong
+> interpreter; the `python -m` form always uses the active environment.
 
 ## Configuration
 
