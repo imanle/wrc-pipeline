@@ -1,0 +1,195 @@
+# Single source of truth for every tunable in the pipeline.
+#
+# `${VAR:-default}` placeholders are expanded at load time (see settings.py), so
+# any value below can be overridden by an environment variable without this file
+# needing to know about it. Secrets belong in .env, never here.
+
+mongo:
+  uri: "${MONGO_URI:-mongodb://wrc:wrc_password@localhost:27017/?authSource=admin}"
+  database: "${MONGO_DATABASE:-wrc}"
+  landing_collection: "documents_landing"
+  curated_collection: "documents_curated"
+  runs_collection: "pipeline_runs"
+  failures_collection: "pipeline_failures"
+  server_selection_timeout_ms: 5000
+
+s3:
+  endpoint_url: "${S3_ENDPOINT_URL:-http://localhost:9000}"
+  access_key: "${S3_ACCESS_KEY:-minioadmin}"
+  secret_key: "${S3_SECRET_KEY:-minioadmin}"
+  region: "${S3_REGION:-us-east-1}"
+  landing_bucket: "${S3_LANDING_BUCKET:-wrc-landing}"
+  curated_bucket: "${S3_CURATED_BUCKET:-wrc-curated}"
+  # Key template for the landing zone. The hash suffix is what makes the zone
+  # append-only: a changed document lands beside its predecessor, never over it.
+  landing_key_template: "{body_slug}/{partition_key}/{identifier}__{hash_prefix}{ext}"
+  # Curated keys are canonical per the brief: identifier.ext, nothing else.
+  curated_key_template: "{body_slug}/{identifier}{ext}"
+
+partitions:
+  # daily | weekly | monthly | quarterly | yearly
+  size: "${PARTITION_SIZE:-monthly}"
+  start_date: "${RUN_START_DATE:-2024-01-01}"
+  end_date: "${RUN_END_DATE:-2025-01-01}"
+
+scraping:
+  base_url: "https://www.workplacerelations.ie"
+  # Confirmed stateless GET (Phase 0 recon). The site is ASP.NET WebForms and the
+  # search submits as a POST, but the server reflects all filter state into the
+  # query string and the resulting URL is reachable with no session cookie and no
+  # __VIEWSTATE -- verified in a clean incognito window. That means every
+  # (body, partition, page) tuple is an independent request, so the crawl is
+  # fully parallelisable and resumable. See ARCHITECTURE.md.
+  #
+  # Contract:
+  #   /en/search/?decisions=1&from=<d/M/yyyy>&to=<d/M/yyyy>&body=<id>[&q=<kw>]
+  #
+  # `from`/`to` take UNPADDED day and month (18/8/2026, not 18/08/2026) whereas
+  # results are DISPLAYED zero-padded (20/08/2026). Two distinct formats; see
+  # date_input_format / date_display_format below.
+  search_path: "${SEARCH_PATH:-/en/search/}"
+  # Constant flag scoping the search to the decisions database.
+  decisions_flag: 1
+  date_input_format: "%-d/%-m/%Y"
+  date_display_format: "%d/%m/%Y"
+  # Multiple bodies can be comma-joined (&body=2,1,3,15376), but we deliberately
+  # issue one request per body so that partitions stay at (body x period)
+  # granularity -- retries, counters and Dagster partitions all key off it.
+  body_param_separator: ","
+  # Confirmed: &pageNumber=2 (1-based; omitted entirely for page 1).
+  page_param: "${SEARCH_PAGE_PARAM:-pageNumber}"
+  # Fixed by the site, 10 results per page. Used with the "of N results"
+  # count to derive the total page count up front, so pages 2..N can be
+  # requested in parallel instead of crawled one "next" link at a time.
+  page_size: 10
+  # Regex over "Shows 1 to 10 of 234 results". Group 3 is the reconciliation
+  # baseline for records_found (requirement 10).
+  result_count_pattern: "Shows\\s+(\\d+)\\s+to\\s+(\\d+)\\s+of\\s+([\\d,]+)\\s+results"
+  # Guard against a runaway pager if the count text ever fails to parse.
+  max_pages_per_partition: ${MAX_PAGES_PER_PARTITION:-500}
+  user_agent: "${SCRAPY_USER_AGENT:-wrc-research-crawler/1.0 (+contact: you@example.com)}"
+  concurrent_requests: ${SCRAPY_CONCURRENT_REQUESTS:-16}
+  concurrent_requests_per_domain: ${SCRAPY_CONCURRENT_PER_DOMAIN:-8}
+  download_delay: ${SCRAPY_DOWNLOAD_DELAY:-0.25}
+  download_timeout: ${SCRAPY_DOWNLOAD_TIMEOUT:-45}
+  autothrottle_enabled: ${SCRAPY_AUTOTHROTTLE_ENABLED:-true}
+  autothrottle_start_delay: 0.5
+  autothrottle_max_delay: 30.0
+  autothrottle_target_concurrency: ${SCRAPY_AUTOTHROTTLE_TARGET_CONCURRENCY:-4.0}
+  retry_times: ${SCRAPY_RETRY_TIMES:-4}
+  retry_http_codes: [429, 500, 502, 503, 504, 408, 522, 524]
+  robotstxt_obey: false  # Documented decision; see ARCHITECTURE.md.
+
+  # The four tribunals from the left-hand "Body" facet.
+  #
+  # `value`         - the integer submitted as `&body=<value>`. Confirmed during
+  #                   Phase 0 recon by reading the checkbox `value` attributes
+  #                   (name="ctl00$ContentPlaceHolder_Main$CB2$CB2_n") and
+  #                   verifying each against the identifier prefix it returns.
+  #                   These are the site's own database keys, not an ordered
+  #                   enum -- note WRC is 15376 -- so they cannot be derived and
+  #                   must not be guessed.
+  # `earliest_date` - start of this body's coverage, per the official "Guide to
+  #                   Searching the Decisions and Determinations Database".
+  #                   Partitions ending before this date are skipped, so a zero
+  #                   result count always means "genuinely empty", never
+  #                   "we queried a period that cannot contain data".
+  # `identifier_pattern` - sanity check on the scraped reference. A selector that
+  #                   silently breaks after a site tweak produces None or page
+  #                   chrome; this turns that into a logged, countable failure
+  #                   instead of 800 corrupt records.
+  bodies:
+    - name: "Workplace Relations Commission"
+      slug: "wrc"
+      value: "15376"
+      earliest_date: "2015-10-01"
+      identifier_pattern: "^(ADJ|IR)[- ]?.*"
+
+    - name: "Labour Court"
+      slug: "labour-court"
+      value: "3"
+      earliest_date: "1986-10-01"
+      identifier_pattern: "^[A-Z]{2,4}[-/ ]?[0-9/]+$"
+
+    - name: "Equality Tribunal"
+      slug: "equality-tribunal"
+      value: "1"
+      earliest_date: "1996-01-01"
+      identifier_pattern: "^(DEC-[A-Z][0-9]{4}-[0-9]+|[A-Z]{2}/[0-9]{4}/[0-9]+)$"
+
+    - name: "Employment Appeals Tribunal"
+      slug: "employment-appeals-tribunal"
+      value: "2"
+      earliest_date: "2007-01-01"
+      identifier_pattern: "^([0-9]{3,6}|[A-Z]{2}[0-9]+/[0-9]{4})$"
+
+  # Labour Court and Equality Tribunal references contain forward slashes
+  # (e.g. CD/12/572, EE/2006/040). The brief requires files be renamed to
+  # `identifier.ext`, and a raw slash would either create an accidental S3
+  # prefix or fail outright on a local filesystem. We therefore keep the raw
+  # `identifier` for fidelity and derive `identifier_safe` for object keys.
+  identifier_unsafe_chars: "/\\\\:*?\"<>| "
+  identifier_replacement: "-"
+
+transform:
+  # Confirmed against a live decision page (Phase 0 recon). Structure is:
+  #
+  #   body#b > div#search
+  #     header                      <- cookie bar, language switch, logos
+  #     div.container.searchbanner  <- site-wide blurb
+  #     div.container.mb-4 > div.container > div.row
+  #       div.col-sm-3              <- "Return to Search"
+  #       div.col-sm-9
+  #         h1.page-title           <- identifier, e.g. "EDA2471"   KEEP
+  #         div.content             <- the determination itself     KEEP
+  #     footer
+  #
+  # WHITELIST, not blacklist. We extract only the elements below and discard the
+  # rest of the document. A blacklist that strips nav/header/footer would still
+  # leak anything the site adds later (survey banners, promos, the "Add To My
+  # Documents" binder, the Google Translate widget). Selecting the content
+  # positively means unknown chrome is excluded by construction.
+  #
+  # Tried in order; the first selector that matches is used. Multiple entries
+  # exist for resilience across bodies, not because we saw them all.
+  content_selectors:
+    - "div.content"
+    - "div.col-sm-9"
+    - "main"
+    - "article"
+  # Prepended to the extracted content when present, so the cleaned file keeps
+  # the identifier heading shown at the top of the boxed region in the brief.
+  title_selector: "h1.page-title"
+
+  # Second pass, applied INSIDE the whitelisted content. `div.content` really
+  # does contain a <script> block, a decorative letterhead image, and 1x1
+  # ecblank.gif spacer GIFs inside the signature table.
+  strip_selectors:
+    - "script"
+    - "style"
+    - "noscript"
+    - "iframe"
+    - "form"
+    - "img[src*='signature_logo']"
+    - "img[src*='ecblank']"
+    - "img[width='1'][height='1']"
+
+  # Explicitly NOT stripped: div.table-responsive and its tables. They carry the
+  # parties, the court division and the signature block -- substantive content
+  # that a generic boilerplate remover would discard as layout.
+  preserve_selectors:
+    - "table"
+    - "div.table-responsive"
+
+  # Drop elements left empty after stripping (the source has many bare <p></p>).
+  drop_empty_elements: true
+  # Collapse &nbsp; and repeated whitespace, which the source uses for spacing.
+  normalise_whitespace: true
+  # Below this, the extraction almost certainly grabbed the wrong node. Flagged
+  # for review rather than silently written.
+  min_content_chars: 200
+
+logging:
+  level: "${LOG_LEVEL:-INFO}"
+  file: "${LOG_FILE:-logs/pipeline.jsonl}"
+  console: true

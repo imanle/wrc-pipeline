@@ -1,0 +1,74 @@
+# Landing-zone infrastructure.
+#
+# Only the *storages* run in containers (as the brief requires). Dagster runs on
+# the host via `dagster dev`, which keeps the demo loop fast and the logs visible.
+#
+# Every port and credential is env-driven so this file is safe to commit.
+
+services:
+  mongo:
+    image: mongo:7.0
+    container_name: wrc-mongo
+    restart: unless-stopped
+    ports:
+      - "${MONGO_HOST_PORT:-27017}:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:-wrc}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-wrc_password}
+      MONGO_INITDB_DATABASE: ${MONGO_DATABASE:-wrc}
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      # `mongosh --eval ping` is the cheapest true readiness signal: the TCP port
+      # opens well before the server will accept queries.
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    container_name: wrc-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    ports:
+      - "${S3_HOST_PORT:-9000}:9000"        # S3 API
+      - "${S3_CONSOLE_HOST_PORT:-9001}:9001" # Web console
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  # One-shot container: creates the two buckets, then exits 0.
+  # Makes `docker compose up` the only setup step a reviewer has to run.
+  minio-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    container_name: wrc-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
+      LANDING_BUCKET: ${S3_LANDING_BUCKET:-wrc-landing}
+      CURATED_BUCKET: ${S3_CURATED_BUCKET:-wrc-curated}
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 $$S3_ACCESS_KEY $$S3_SECRET_KEY &&
+      mc mb --ignore-existing local/$$LANDING_BUCKET &&
+      mc mb --ignore-existing local/$$CURATED_BUCKET &&
+      mc version enable local/$$LANDING_BUCKET &&
+      echo 'buckets ready'
+      "
+
+volumes:
+  mongo_data:
+  minio_data:
