@@ -58,25 +58,42 @@ scraping:
   # deliberately issue one request per body so that partitions stay at
   # (body x period) granularity -- retries, counters and Dagster partition keys
   # all key off that tuple. See ARCHITECTURE.md.
-  # Confirmed against a live results page (Phase 0 recon). One record is:
+
+  # Confirmed against a live results page (Phase 0 recon; re-verified 2026-09-01
+  # against WRC / January 2024, which still returns 234 results). One record is:
   #
   #   <li class="each-item clearfix">
-  #     <h2 class="title" title="IR - SC - 00000787">
-  #       <a href="/en/cases/2024/january/ir- sc- 00000787.html">...</a></h2>
-  #     <span class="date">31/01/2024</span>
-  #     <p class="fullpath" title="/en/cases/2024/january/ir- sc- 00000787.html"></p>
-  #     <p class="description" title="Office Administrator V A Translation Service">...</p>
-  #     <span class="refNO">IR - SC - 00000787</span>
-  #     <div class="col-sm-3 link"><a href="...">View Page</a></div>
+  #     <div class="row">
+  #       <div class="col-sm-9">
+  #         <h2 class="title" title="ADJ-00047352">
+  #           <a href="/en/cases/2024/january/adj-00047352.html"
+  #              title="ADJ-00047352">ADJ-00047352</a></h2>
+  #       </div>
+  #       <div class="col-sm-3"><span class="date">31/01/2024</span></div>
+  #     </div>
+  #     <p class="fullpath" title="/en/cases/2024/january/adj-00047352.html"></p>
+  #     <p class="description" title="Car Valet V Motor Garage">Car Valet V Motor Garage</p>
+  #     <div class="row bottom-ref">
+  #       <div class="col-sm-9 ref"><span>Ref no: </span>
+  #         <span class="refNO">ADJ-00047352</span></div>
+  #       <div class="col-sm-3 link">
+  #         <a class="btn btn-primary" href="/en/cases/2024/january/adj-00047352.html">View Page</a></div>
+  #     </div>
   #   </li>
+  #
+  # The selectors below are all descendant-based rather than path-based, which is
+  # why the div.row / col-sm-* wrappers are irrelevant to them. That is
+  # deliberate: Bootstrap grid classes are layout and change with a restyle,
+  # whereas `each-item`, `refNO` and `fullpath` are semantic and stable.
   #
   # Attributes are preferred over text nodes: `p.description@title` carries the
   # untruncated value and needs no whitespace normalisation.
   #
-  # NOTE: the identifier appears THREE times (h2.title@title, the anchor text,
-  # and span.refNO). Cross-checking them is a free integrity test -- if they
-  # disagree, our parse has drifted from the DOM and the record should fail
-  # loudly rather than be written with a wrong reference.
+  # NOTE: the identifier appears FOUR times -- h2.title@title, the anchor's own
+  # title attribute, the anchor text, and span.refNO. Cross-checking two of them
+  # is a free integrity test: if they disagree, our parse has drifted from the
+  # DOM and the record should fail loudly rather than be written with a wrong
+  # reference.
   listing:
     record: "li.each-item"
     identifier: "h2.title::attr(title)"
