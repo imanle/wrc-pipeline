@@ -25,6 +25,9 @@ s3:
   landing_key_template: "{body_slug}/{partition_key}/{identifier}__{hash_prefix}{ext}"
   # Curated keys are canonical per the brief: identifier.ext, nothing else.
   curated_key_template: "{body_slug}/{identifier}{ext}"
+  hash_prefix_length: ${S3_HASH_PREFIX_LENGTH:-8}
+  hash_chunk_bytes: ${S3_HASH_CHUNK_BYTES:-65536}
+  max_attempts: ${S3_MAX_ATTEMPTS:-5}
 
 partitions:
   # daily | weekly | monthly | quarterly | yearly
@@ -46,16 +49,64 @@ scraping:
   #
   # `from`/`to` take UNPADDED day and month (18/8/2026, not 18/08/2026) whereas
   # results are DISPLAYED zero-padded (20/08/2026). Two distinct formats; see
-  # date_input_format / date_display_format below.
+  # format_input_date() / date_display_format below.
   search_path: "${SEARCH_PATH:-/en/search/}"
   # Constant flag scoping the search to the decisions database.
   decisions_flag: 1
-  date_input_format: "%-d/%-m/%Y"
   date_display_format: "%d/%m/%Y"
-  # Multiple bodies can be comma-joined (&body=2,1,3,15376), but we deliberately
-  # issue one request per body so that partitions stay at (body x period)
-  # granularity -- retries, counters and Dagster partitions all key off it.
-  body_param_separator: ","
+  # NOTE: the site also accepts comma-joined bodies (&body=2,1,3,15376), but we
+  # deliberately issue one request per body so that partitions stay at
+  # (body x period) granularity -- retries, counters and Dagster partition keys
+  # all key off that tuple. See ARCHITECTURE.md.
+  # Confirmed against a live results page (Phase 0 recon). One record is:
+  #
+  #   <li class="each-item clearfix">
+  #     <h2 class="title" title="IR - SC - 00000787">
+  #       <a href="/en/cases/2024/january/ir- sc- 00000787.html">...</a></h2>
+  #     <span class="date">31/01/2024</span>
+  #     <p class="fullpath" title="/en/cases/2024/january/ir- sc- 00000787.html"></p>
+  #     <p class="description" title="Office Administrator V A Translation Service">...</p>
+  #     <span class="refNO">IR - SC - 00000787</span>
+  #     <div class="col-sm-3 link"><a href="...">View Page</a></div>
+  #   </li>
+  #
+  # Attributes are preferred over text nodes: `p.description@title` carries the
+  # untruncated value and needs no whitespace normalisation.
+  #
+  # NOTE: the identifier appears THREE times (h2.title@title, the anchor text,
+  # and span.refNO). Cross-checking them is a free integrity test -- if they
+  # disagree, our parse has drifted from the DOM and the record should fail
+  # loudly rather than be written with a wrong reference.
+  listing:
+    record: "li.each-item"
+    identifier: "h2.title::attr(title)"
+    identifier_crosscheck: "span.refNO::text"
+    published_date: "span.date::text"
+    description: "p.description::attr(title)"
+    document_link: "div.link a::attr(href)"
+    document_link_fallback: "p.fullpath::attr(title)"
+
+  # CRITICAL: always follow the site's own href. NEVER rebuild a document URL
+  # from the identifier. Three incompatible manglings were observed:
+  #
+  #   IR - SC - 00000787   -> /en/cases/2024/january/ir- sc- 00000787.html
+  #                           (literal spaces after the hyphens!)
+  #   EDA2471              -> /en/cases/2024/december/eda2471.html
+  #   RP2147/2009 + 2 more -> /en/cases/2010/december/rp2147_2009_mn1794_2009_wt796_2009.html
+  #                           (three case refs concatenated into one filename)
+  #
+  # No rule derives these. The obvious optimisation of skipping the listing and
+  # constructing URLs from references would fail on entire bodies.
+
+  # Recon also found: every document sampled is .html (3 bodies, 2010-2024, no
+  # PDFs). The PDF branch of requirement 6a is implemented and unit tested
+  # against a synthetic file but is not exercised by live data in this range.
+  # Extension is taken from the resolved URL and cross-checked against the
+  # response Content-Type.
+  document_extensions:
+    html: [".html", ".htm", ".aspx"]
+    binary: [".pdf", ".doc", ".docx", ".rtf"]
+
   # Confirmed: &pageNumber=2 (1-based; omitted entirely for page 1).
   page_param: "${SEARCH_PAGE_PARAM:-pageNumber}"
   # Fixed by the site, 10 results per page. Used with the "of N results"

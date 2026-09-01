@@ -108,6 +108,9 @@ class S3Settings(BaseModel):
     curated_bucket: str
     landing_key_template: str
     curated_key_template: str
+    hash_prefix_length: int = Field(default=8, ge=6, le=64)
+    hash_chunk_bytes: int = Field(default=65536, gt=0)
+    max_attempts: int = Field(default=5, gt=0)
 
     @model_validator(mode="after")
     def _distinct_buckets(self) -> "S3Settings":
@@ -181,12 +184,41 @@ class BodySettings(BaseModel):
         return bool(re.match(self.identifier_pattern, identifier.strip()))
 
 
+class ListingSelectors(BaseModel):
+    """CSS selectors for one record on the search results page.
+
+    Confirmed against live markup during recon. Held in config rather than
+    hardcoded in the spider so a site redesign is a YAML edit, and so the
+    selectors are visible to a reviewer without reading spider code.
+    """
+
+    record: str
+    identifier: str
+    identifier_crosscheck: str | None = None
+    published_date: str
+    description: str
+    document_link: str
+    document_link_fallback: str | None = None
+
+
+class DocumentExtensions(BaseModel):
+    """Which file extensions are treated as HTML vs binary (requirement 6)."""
+
+    html: list[str] = Field(min_length=1)
+    binary: list[str] = Field(min_length=1)
+
+    def is_html(self, ext: str) -> bool:
+        return ext.lower() in {e.lower() for e in self.html}
+
+    def is_binary(self, ext: str) -> bool:
+        return ext.lower() in {e.lower() for e in self.binary}
+
+
 class ScrapingSettings(BaseModel):
     base_url: str
     search_path: str
     decisions_flag: int = 1
     date_display_format: str = "%d/%m/%Y"
-    body_param_separator: str = ","
     # Confirmed by recon: &pageNumber=2, 1-based, omitted for page 1.
     page_param: str = "pageNumber"
     result_count_pattern: str = (
@@ -207,6 +239,8 @@ class ScrapingSettings(BaseModel):
     retry_http_codes: list[int]
     robotstxt_obey: bool
     bodies: list[BodySettings] = Field(min_length=1)
+    listing: ListingSelectors
+    document_extensions: DocumentExtensions
     identifier_unsafe_chars: str = '/\\:*?"<>| '
     identifier_replacement: str = "-"
 
