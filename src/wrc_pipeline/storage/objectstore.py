@@ -101,7 +101,12 @@ class StoredObject:
 
     bucket: str
     key: str
-    file_hash: str  # full 64-char SHA-256 hex digest
+    file_hash: str  # SHA-256 of the bytes actually stored (requirement 8)
+    # SHA-256 after per-request noise is stripped. This is what the key embeds
+    # and what change detection compares, because the raw bytes of these pages
+    # differ on every fetch (an ASP.NET render timer) while the document does
+    # not. Equals file_hash when no normalisation applies.
+    content_hash: str
     file_size: int
     content_type: str
     outcome: UploadOutcome
@@ -534,9 +539,16 @@ def put_landing_document(
     data: bytes | IO[bytes],
     source_url: str | None = None,
     content_type: str | None = None,
+    key_hash: str | None = None,
     settings: Settings | None = None,
 ) -> StoredObject:
     """Store one document in the landing zone, skipping unchanged content.
+
+    Pass *key_hash* when the raw bytes contain per-request noise: the key is then
+    derived from that normalised digest instead of the raw one, so a document
+    whose only difference is a render timestamp maps to the same key and is
+    skipped. The raw digest is still stored on the object and returned as
+    ``file_hash``.
 
     The sequence is: hash the payload, derive the content-addressed key, HEAD it,
     and upload only if it is absent. Because the key *is* the hash, a hit proves
@@ -559,7 +571,8 @@ def put_landing_document(
     else:
         file_hash = sha256_fileobj(data, settings.s3.hash_chunk_bytes)
 
-    key = landing_key(body_slug, partition_key, identifier_safe, file_hash, ext, settings)
+    content_hash = key_hash or file_hash
+    key = landing_key(body_slug, partition_key, identifier_safe, content_hash, ext, settings)
     bucket = settings.s3.landing_bucket
     resolved_type = content_type or content_type_for(ext)
 
@@ -576,10 +589,18 @@ def put_landing_document(
                 "file_hash": file_hash,
             },
         )
+        # Report the hash of what is ACTUALLY stored, taken from the object's own
+        # metadata, not the hash of the bytes we just fetched. With normalisation
+        # in play those differ -- the stored copy is the first version captured --
+        # and reporting the fresh raw hash would make the metadata record
+        # disagree with the file it points at, and would look like a change to
+        # Mongo on every single run.
+        stored_hash = (existing.get("Metadata") or {}).get("sha256") or file_hash
         return StoredObject(
             bucket=bucket,
             key=key,
-            file_hash=file_hash,
+            file_hash=stored_hash,
+            content_hash=content_hash,
             file_size=int(existing.get("ContentLength", 0)),
             content_type=existing.get("ContentType", resolved_type),
             outcome=UploadOutcome.SKIPPED_UNCHANGED,
@@ -610,6 +631,7 @@ def put_landing_document(
         bucket=bucket,
         key=key,
         file_hash=file_hash,
+        content_hash=content_hash,
         file_size=size,
         content_type=resolved_type,
         outcome=UploadOutcome.UPLOADED,
@@ -668,6 +690,7 @@ def put_curated_document(
         bucket=bucket,
         key=key,
         file_hash=file_hash,
+        content_hash=file_hash,
         file_size=size,
         content_type=resolved_type,
         outcome=UploadOutcome.UPLOADED,

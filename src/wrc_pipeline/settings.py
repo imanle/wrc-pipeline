@@ -241,8 +241,26 @@ class ScrapingSettings(BaseModel):
     bodies: list[BodySettings] = Field(min_length=1)
     listing: ListingSelectors
     document_extensions: DocumentExtensions
+    # Byte patterns that change on every request without the document changing.
+    # WRC appends `<!-- Elapsed time: 0.046756 -->` (server render time) to every
+    # page, so a raw byte hash differs on every fetch and change detection would
+    # report all 234 January documents as amended on every run. Stripped before
+    # computing the comparison hash only -- the stored file keeps the page
+    # exactly as fetched.
+    volatile_content_patterns: list[str] = Field(default_factory=list)
     identifier_unsafe_chars: str = '/\\:*?"<>| '
     identifier_replacement: str = "-"
+
+    def strip_volatile(self, data: bytes) -> bytes:
+        """Remove per-request noise so equal documents hash equally.
+
+        Operates on bytes, not text: the result feeds a hash, and decoding a
+        document to strip a comment would mean guessing an encoding and could
+        itself change the bytes.
+        """
+        for pattern in self.volatile_content_patterns:
+            data = re.sub(pattern.encode("utf-8"), b"", data)
+        return data
 
     def parse_result_count(self, text: str) -> int | None:
         """Extract the total from ``Shows 1 to 10 of 234 results``.

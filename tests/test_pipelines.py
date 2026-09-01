@@ -28,6 +28,7 @@ from wrc_pipeline.scraper.items import DocumentRecord, RecordStatus
 from wrc_pipeline.scraper.pipelines import DocumentDownloadPipeline
 from wrc_pipeline.settings import load_settings
 from wrc_pipeline.storage.mongo import WriteOutcome
+from wrc_pipeline.storage import objectstore as real_store
 from wrc_pipeline.storage.objectstore import StoredObject, UploadOutcome
 
 DOC_URL = "https://www.workplacerelations.ie/en/cases/2024/january/adj-00054658.html"
@@ -119,15 +120,26 @@ class StoreSpy:
     def ensure_buckets(self, settings=None):
         pass
 
+    # The real hashing function, deliberately: the pipeline uses it to derive the
+    # content hash, and a stub here would make the volatile-content tests below
+    # assert on fake digests.
+    sha256_bytes = staticmethod(real_store.sha256_bytes)
+
     def put_landing_document(self, **kwargs):
         if self.error:
             raise self.error
         self.uploads.append(kwargs)
+        # Real digests, not placeholders: the key is derived from the content
+        # hash while file_hash describes the stored bytes, and a fake that
+        # returned one canned value for both could not show the difference.
+        file_hash = real_store.sha256_bytes(kwargs["data"])
+        content_hash = kwargs.get("key_hash") or file_hash
         return StoredObject(
             bucket="wrc-landing",
             key=f"{kwargs['body_slug']}/{kwargs['partition_key']}/"
-            f"{kwargs['identifier_safe']}__abc12345{kwargs['ext']}",
-            file_hash="abc12345" + "0" * 56,
+            f"{kwargs['identifier_safe']}__{content_hash[:8]}{kwargs['ext']}",
+            file_hash=file_hash,
+            content_hash=content_hash,
             file_size=len(kwargs["data"]),
             content_type="text/html; charset=utf-8",
             outcome=self.outcome,
@@ -198,7 +210,7 @@ def test_document_is_downloaded_uploaded_and_recorded(cfg, monkeypatch, item):
     assert len(store_spy.uploads) == 1
     assert len(mongo_spy.upserts) == 1
     assert record.status is RecordStatus.SCRAPED
-    assert record.file_hash == "abc12345" + "0" * 56
+    assert record.file_hash == real_store.sha256_bytes(store_spy.uploads[0]["data"])
     assert record.file_bucket == "wrc-landing"
     assert spider.counters[("wrc", "2024-01")].scraped == 1
 
@@ -354,6 +366,61 @@ def test_counting_follows_mongo_not_the_object_store(cfg, monkeypatch, item):
 
 
 # --------------------------------------------------------------------------- #
+# Volatile page content -- the second-run regression
+# --------------------------------------------------------------------------- #
+PAGE = b"<html><body>decision text</body></html>\n<!-- Elapsed time: 0.046756 -->"
+PAGE_AGAIN = b"<html><body>decision text</body></html>\n<!-- Elapsed time: 0.0468506 -->"
+PAGE_AMENDED = b"<html><body>amended text</body></html>\n<!-- Elapsed time: 0.046756 -->"
+
+
+def test_render_timer_does_not_count_as_a_change(cfg, monkeypatch, item):
+    """The bug the first two live runs exposed.
+
+    Every WRC page ends with an ASP.NET render timer, so consecutive fetches of
+    an unchanged decision differ in raw bytes. Hashing those bytes made all 234
+    January documents look amended on the second run: 234 spurious uploads and
+    234 spurious `versions` entries. The comparison hash must ignore it.
+    """
+    spider = FakeSpider()
+
+    first, _, store_a = _pipeline(cfg, monkeypatch, _response(body=PAGE))
+    record_a = _run(first, item, spider)
+
+    second, _, store_b = _pipeline(cfg, monkeypatch, _response(body=PAGE_AGAIN))
+    record_b = _run(second, item, spider)
+
+    # Raw bytes differ...
+    assert store_a.uploads[0]["data"] != store_b.uploads[0]["data"]
+    # ...but the content hash, and therefore the object key, do not.
+    assert record_a.content_hash == record_b.content_hash
+    assert store_a.uploads[0]["key_hash"] == store_b.uploads[0]["key_hash"]
+
+
+def test_genuine_content_change_is_still_detected(cfg, monkeypatch, item):
+    """The check must not be so permissive that a real amendment slips through."""
+    spider = FakeSpider()
+
+    first, _, _ = _pipeline(cfg, monkeypatch, _response(body=PAGE))
+    record_a = _run(first, item, spider)
+
+    second, _, _ = _pipeline(cfg, monkeypatch, _response(body=PAGE_AMENDED))
+    record_b = _run(second, item, spider)
+
+    assert record_a.content_hash != record_b.content_hash
+
+
+def test_file_hash_still_describes_the_stored_bytes(cfg, monkeypatch, item):
+    """Requirement 8 asks for the hash of the file. Normalisation only affects
+    the comparison hash -- file_hash must still match what is in the bucket."""
+    spider = FakeSpider()
+    pipeline, _, store_spy = _pipeline(cfg, monkeypatch, _response(body=PAGE))
+
+    record = _run(pipeline, item, spider)
+    assert record.file_hash == real_store.sha256_bytes(store_spy.uploads[0]["data"])
+    assert record.file_hash != record.content_hash  # the page has a timer
+
+
+# --------------------------------------------------------------------------- #
 # Failures
 # --------------------------------------------------------------------------- #
 def test_404_is_dropped_counted_and_logged_with_its_code(cfg, monkeypatch, item):
@@ -496,6 +563,12 @@ def test_close_spider_persists_reconciled_totals(cfg, monkeypatch, item):
     counters.found = 2
     _run(pipeline, item, spider)
     counters.skipped = 1
+    # The spider registers entries and references as it parses; this test drives
+    # the pipeline directly, so stand in for that.
+    counters.record_entry()
+    counters.record_entry()
+    counters.record_seen("ADJ-00054658")
+    counters.record_seen("ADJ-00099999")
 
     pipeline.close_spider(spider)
 
@@ -504,6 +577,7 @@ def test_close_spider_persists_reconciled_totals(cfg, monkeypatch, item):
     assert totals["records_found"] == 2
     assert totals["records_scraped"] == 1
     assert totals["records_skipped_unchanged"] == 1
+    assert totals["records_distinct"] == 2
     assert totals["reconciled"] is True
     assert status == "completed"
 
@@ -513,6 +587,7 @@ def test_discrepancy_is_reflected_in_the_run_status(cfg, monkeypatch, item):
     spider = FakeSpider()
     pipeline, mongo_spy, _ = _pipeline(cfg, monkeypatch, _response())
 
+    # Ten entries advertised, none served: real loss.
     spider.counters_for("wrc", "2024-01").found = 10
     pipeline.close_spider(spider)
 

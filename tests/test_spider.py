@@ -12,6 +12,7 @@ live smoke run over one month is what checks the latter.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import date
 
 import pytest
@@ -81,14 +82,39 @@ def _page(total: int | None = 234, items: str | None = None, url: str = SEARCH_U
 
 
 def _spider(cfg, **kwargs) -> WrcDecisionsSpider:
+    """Build a spider for testing.
+
+    The partition size is pinned to monthly rather than inherited from config.
+    Tests that assert request counts would otherwise change meaning whenever the
+    configured default changes -- which it did, from monthly to weekly, after
+    pagination drift was observed on a live run. A test asserting "3 partitions
+    for a 3-month range" should be about partition generation, not about which
+    default happens to be in the YAML.
+    """
     kwargs.setdefault("start_date", "2024-01-01")
     kwargs.setdefault("end_date", "2024-01-31")
+    kwargs.setdefault("partition_size", "monthly")
     return WrcDecisionsSpider(config=cfg, **kwargs)
 
 
 # --------------------------------------------------------------------------- #
 # Scope resolution
 # --------------------------------------------------------------------------- #
+def test_partition_size_argument_is_honoured(cfg):
+    """January is one monthly partition but five weekly ones. Weekly is the
+    configured default because a live run showed pagination drift across 24
+    concurrent pages; the effective value is not asserted here, since overriding
+    it through PARTITION_SIZE is legitimate use."""
+    spider = _spider(
+        cfg,
+        start_date="2024-01-01",
+        end_date="2024-01-31",
+        bodies="wrc",
+        partition_size="weekly",
+    )
+    assert len(list(spider.start_requests())) == 5
+
+
 def test_cli_dates_are_parsed(cfg):
     spider = _spider(cfg, start_date="2024-03-01", end_date="2024-04-30")
     assert spider.start_date == date(2024, 3, 1)
@@ -122,6 +148,37 @@ def test_one_start_request_per_body_and_partition(cfg):
     spider = _spider(cfg, start_date="2024-01-01", end_date="2024-03-31", bodies="wrc")
     requests = list(spider.start_requests())
     assert len(requests) == 3  # three monthly partitions, one body
+
+
+def test_start_yields_the_planned_requests(cfg):
+    """Scrapy 2.13+ calls start(), NOT start_requests().
+
+    Regression test for a silent failure found on the first live run: without an
+    explicit async start(), Scrapy's default implementation reads start_urls,
+    finds none, issues zero requests, and the run still exits 0 with
+    "reconciled: true" because nothing was ever found.
+    """
+    spider = _spider(cfg, start_date="2024-01-01", end_date="2024-03-31", bodies="wrc")
+
+    async def collect():
+        return [request async for request in spider.start()]
+
+    requests = asyncio.run(collect())
+    assert len(requests) == 3
+    assert all(isinstance(request, Request) for request in requests)
+
+
+def test_planned_requests_is_recorded(cfg):
+    """Lets the caller tell "nothing to do" apart from "planned work, did none"."""
+    spider = _spider(cfg, start_date="2024-01-01", end_date="2024-03-31", bodies="wrc")
+    list(spider.start_requests())
+    assert spider.planned_requests == 3
+
+
+def test_planned_requests_is_zero_for_an_uncovered_range(cfg):
+    spider = _spider(cfg, start_date="2014-01-01", end_date="2014-03-31", bodies="wrc")
+    list(spider.start_requests())
+    assert spider.planned_requests == 0
 
 
 def test_partitions_before_coverage_are_skipped(cfg):
@@ -358,10 +415,10 @@ def test_closed_emits_a_summary_per_partition(cfg, partition, caplog):
 
 
 def test_run_summary_reports_unreconciled_partitions(cfg, partition, caplog):
-    """found(1) != scraped(0) + skipped(0) + failed(0) because the download
-    pipeline has not run. The summary must say so rather than look healthy."""
+    """The site states 1 result but the page holds none, so one record is
+    unaccounted for and the summary must say so rather than look healthy."""
     spider = _spider(cfg)
-    list(spider.parse_listing(_page(total=1), "wrc", partition, 1))
+    list(spider.parse_listing(_page(total=1, items=""), "wrc", partition, 1))
 
     with caplog.at_level("INFO"):
         spider.closed("finished")
@@ -369,6 +426,22 @@ def test_run_summary_reports_unreconciled_partitions(cfg, partition, caplog):
     summary = next(r for r in caplog.records if r.msg == "crawl.summary")
     assert summary.reconciled is False
     assert summary.unreconciled_partitions == ["wrc/2024-01"]
+    # The site advertised one entry and served none, so it is the LISTINGS check
+    # that fails here, not the records check -- which is exactly the distinction
+    # the split buys: this points at fetching, not at storage.
+    assert summary.listings_unaccounted == 1
+    assert summary.records_unaccounted == 0
+
+
+def test_parsed_records_are_registered_as_distinct(cfg, partition):
+    """Keyed on identifier_safe so the site's two renderings of one reference
+    (`IR-SC-00001259` and `IR - SC - 00001897`) do not count as two records."""
+    spider = _spider(cfg)
+    items = _item_html(identifier="IR - SC - 00000787")
+    items += _item_html(identifier="IR-SC-00000787", href="/en/cases/2024/january/x.html")
+    list(spider.parse_page(_page(items=items), "wrc", partition, 2))
+
+    assert spider.counters[("wrc", "2024-01")].seen == {"IR-SC-00000787"}
 
 
 # --------------------------------------------------------------------------- #

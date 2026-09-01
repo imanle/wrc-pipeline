@@ -66,7 +66,14 @@ def clean_collections(live_db, settings):
     yield
 
 
-def _record(identifier="ADJ-00054658", file_hash="hash-aaa", body="wrc"):
+def _record(identifier="ADJ-00054658", file_hash="hash-aaa", body="wrc", content_hash=None):
+    """A record shaped like the ones the pipeline actually writes.
+
+    content_hash defaults to a value derived from file_hash rather than being
+    omitted: every record the download pipeline produces carries one, and a
+    fixture that leaves it out makes a genuinely-null field indistinguishable
+    from a projection bug.
+    """
     return {
         "identifier": identifier,
         "identifier_safe": identifier.replace("/", "-"),
@@ -79,6 +86,7 @@ def _record(identifier="ADJ-00054658", file_hash="hash-aaa", body="wrc"):
         "document_url": f"https://example.ie/{identifier}.html",
         "file_path": f"{body}/2024-01/{identifier}__{file_hash[:6]}.html",
         "file_hash": file_hash,
+        "content_hash": content_hash or f"content-{file_hash}",
         "run_id": "test-run-1",
     }
 
@@ -152,6 +160,47 @@ def test_previous_version_is_preserved_not_overwritten(settings):
     assert len(stored["versions"]) == 1
     assert stored["versions"][0]["file_hash"] == "hash-aaa"
     assert "content_changed_at" in stored
+
+    # The PATH matters as much as the hash. The superseded object still exists in
+    # the bucket -- keys embed the hash, so the new download landed beside it --
+    # but without its path recorded, that history is unreachable and keeping
+    # versions at all is pointless.
+    #
+    # A live run wrote `file_path: None` here for six documents: the internal
+    # projection fetched file_hash and versions but not file_path, so the code
+    # copying it read a field it had not asked for. Asserting only on file_hash
+    # is what let that through.
+    assert stored["versions"][0]["file_path"] == "wrc/2024-01/ADJ-00054658__hash-a.html"
+    assert stored["versions"][0]["file_path"] != stored["file_path"]
+
+
+def test_a_version_entry_matches_the_record_it_superseded(settings):
+    """Guards the class of bug rather than the instance.
+
+    Twice a projection has silently starved the code reading it: once for
+    etag/last_modified (conditional requests became dead code), once for
+    file_path (version history became unreachable, with `file_path: None` written
+    for six live documents).
+
+    The invariant is NOT "no nulls" -- a field the superseded record genuinely
+    lacked is legitimately null. It is that every field the version entry copies
+    holds the value the earlier record actually had. That catches a missing
+    projection while tolerating a missing field.
+    """
+    first = _record(file_hash="hash-aaa")
+    mongo_store.upsert_landing_record(first, settings)
+    mongo_store.upsert_landing_record(_record(file_hash="hash-bbb"), settings)
+
+    stored = mongo_store.landing_collection(settings).find_one({"identifier": "ADJ-00054658"})
+    version = stored["versions"][0]
+
+    for field, value in version.items():
+        if field == "superseded_at":  # generated, not copied
+            continue
+        assert value == first[field], (
+            f"version['{field}'] is {value!r} but the superseded record had "
+            f"{first[field]!r} -- is {field} missing from the projection?"
+        )
 
 
 def test_first_seen_at_is_never_modified(settings):

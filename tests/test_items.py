@@ -137,6 +137,7 @@ def _stored(outcome=UploadOutcome.UPLOADED) -> StoredObject:
         bucket="wrc-landing",
         key="wrc/2024-01/ADJ-00054658__a3f9c1d4.html",
         file_hash="a3f9c1d4" + "0" * 56,
+        content_hash="a3f9c1d4" + "0" * 56,
         file_size=4096,
         content_type="text/html; charset=utf-8",
         outcome=outcome,
@@ -153,6 +154,12 @@ def test_attach_stored_object_fills_every_storage_field():
     assert record.file_size == 4096
     assert record.content_type == "text/html; charset=utf-8"
     assert record.is_stored is True
+
+
+def test_content_hash_is_carried_onto_the_record():
+    """Change detection depends on it, so it must survive the transition."""
+    record = _record().attach_stored_object(_stored())
+    assert record.content_hash == "a3f9c1d4" + "0" * 56
 
 
 def test_uploaded_becomes_scraped_and_skipped_becomes_skipped():

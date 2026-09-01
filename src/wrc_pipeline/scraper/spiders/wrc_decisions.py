@@ -43,8 +43,9 @@ partition, not "zero results".
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from datetime import date, datetime
-from typing import Any, Iterator
+from typing import Any
 
 import scrapy
 from scrapy.http import Response
@@ -55,6 +56,16 @@ from ...settings import BodySettings, Settings, get_settings
 from ..items import DocumentRecord, record_from_listing
 
 log = get_logger(__name__)
+
+
+def partition_size_value(size: Any) -> str:
+    """Plain string for a partition size.
+
+    str() on a (str, Enum) member yields "PartitionSize.MONTHLY", which is a
+    Python repr leaking into logs and into the runs collection. Accepts a plain
+    string too, since the CLI passes one.
+    """
+    return getattr(size, "value", str(size))
 
 
 def _parse_cli_date(value: str | date | None, fallback: date) -> date:
@@ -125,6 +136,9 @@ class WrcDecisionsSpider(scrapy.Spider):
         # tuple rather than held as spider state because pages from many
         # partitions are in flight simultaneously and their counts must not mix.
         self.counters: dict[tuple[str, str], PartitionCounters] = {}
+        # How many (body, partition) requests were planned. Lets the caller
+        # distinguish "nothing to do" from "we planned work and did none".
+        self.planned_requests = 0
         # Partitions whose result total could not be parsed. Tracked separately
         # because they have no trustworthy baseline, so they cannot be reconciled
         # at all -- distinct from a partition that reconciled badly.
@@ -153,6 +167,21 @@ class WrcDecisionsSpider(scrapy.Spider):
     # ------------------------------------------------------------------ #
     # Request generation
     # ------------------------------------------------------------------ #
+    async def start(self) -> Any:
+        """Scrapy 2.13+ entry point for initial requests.
+
+        REQUIRED, not optional. Scrapy's default ``start()`` reads ``start_urls``
+        and does not call ``start_requests()``, so without this the crawl issues
+        zero requests and still exits cleanly -- no error, no deprecation
+        warning, just "Crawled 0 pages" and a run that reconciles trivially
+        because nothing was found. Found on the first live run.
+
+        ``start_requests()`` is kept as the synchronous implementation: it is
+        pure planning with no I/O, which keeps it directly testable.
+        """
+        for request in self.start_requests():
+            yield request
+
     def start_requests(self) -> Iterator[scrapy.Request]:
         """One page-1 request per ``(body, partition)``.
 
@@ -180,12 +209,13 @@ class WrcDecisionsSpider(scrapy.Spider):
                 planned += 1
                 yield self._listing_request(body, partition, page=1)
 
+        self.planned_requests = planned
         log.info(
             "run.plan",
             extra={
                 "start_date": self.start_date.isoformat(),
                 "end_date": self.end_date.isoformat(),
-                "partition_size": str(self.partition_size),
+                "partition_size": partition_size_value(self.partition_size),
                 "bodies": [body.slug for body in self.bodies],
                 "partitions": len(partitions),
                 "start_requests": planned,
@@ -339,9 +369,13 @@ class WrcDecisionsSpider(scrapy.Spider):
         selectors = self.cfg.scraping.listing
 
         for block in response.css(selectors.record):
+            # Counted before validation: this is an entry the site served, which
+            # is a different question from whether we could read it.
+            counters.record_entry()
             identifier = self._first(block, selectors.identifier)
 
             if not identifier:
+                counters.record_unidentified()
                 counters.record_failure(response.url, "identifier_missing", "selector")
                 continue
 
@@ -425,6 +459,11 @@ class WrcDecisionsSpider(scrapy.Spider):
                     },
                 )
 
+            # Keyed on identifier_safe, not the raw identifier: the site renders
+            # the same reference both ways (`IR-SC-00001259` and
+            # `IR - SC - 00001897`), so the raw form would count one decision as
+            # two distinct records.
+            counters.record_seen(record.identifier_safe)
             yield record
 
     @staticmethod
@@ -456,6 +495,12 @@ class WrcDecisionsSpider(scrapy.Spider):
             "records_scraped": 0,
             "records_skipped_unchanged": 0,
             "records_failed": 0,
+            "records_distinct": 0,
+            "listings_served": 0,
+            "duplicate_listings": 0,
+            "listings_unidentified": 0,
+            "listings_unaccounted": 0,
+            "records_unaccounted": 0,
         }
         unreconciled: list[str] = []
 

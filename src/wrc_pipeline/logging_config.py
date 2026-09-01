@@ -131,16 +131,87 @@ class PartitionCounters:
     partitions concurrently without the counts bleeding into each other.
     """
 
-    __slots__ = ("body", "partition_key", "found", "scraped", "skipped", "failed", "failures")
+    __slots__ = (
+        "body",
+        "partition_key",
+        "listings",
+        "scraped",
+        "skipped",
+        "failed",
+        "failures",
+        "seen",
+        "entries",
+        "unidentified",
+    )
 
     def __init__(self, body: str, partition_key: str) -> None:
         self.body = body
         self.partition_key = partition_key
-        self.found = 0
+        # The site's stated total, which counts LISTING ENTRIES, not decisions.
+        self.listings = 0
         self.scraped = 0
         self.skipped = 0  # already present and unchanged -> idempotent no-op
         self.failed = 0
         self.failures: list[dict[str, Any]] = []
+        # DISTINCT references accounted for, and the number the stated total must
+        # be compared against. Two live observations of the same date range
+        # (WRC, 2024-01-29..31, stated total 46) established why:
+        #
+        #   run A (sequential, 0.5s delay): 46 entries served, 6 of them repeats
+        #                                   of page 1 on page 2 -> 40 distinct
+        #   run B (normal crawl):           46 entries served, 46 distinct
+        #
+        # Run B proves 46 distinct decisions exist, so run A's 6 duplicates
+        # DISPLACED 6 real decisions that were never served at all. The site's
+        # page windows shift between requests, and when they overlap, records
+        # fall through the gap. The stated total counts decisions; overlap is
+        # loss, not a benign artefact of counting.
+        #
+        # Hence the operation counts alone cannot be trusted: in run A a
+        # duplicated store offsets a missed record exactly one-for-one, and
+        # `found == scraped + skipped + failed` reconciles perfectly while six
+        # documents are silently absent.
+        self.seen: set[str] = set()
+        # Listing entries actually SERVED to us, duplicates included. Distinct
+        # from `listings` (advertised) and from `len(seen)` (decisions), and all
+        # three are needed: advertised-minus-served finds entries the site never
+        # produced, served-minus-distinct measures its page overlap.
+        self.entries = 0
+        # Served entries with no readable reference. Excluded from the overlap
+        # arithmetic so they are not miscounted as duplicates; each one also
+        # raises a failure with its reason.
+        self.unidentified = 0
+
+    @property
+    def found(self) -> int:
+        """Alias for :attr:`listings`.
+
+        The spider and the CLI were written against ``found``, and the brief uses
+        that word. Kept as a property so the rename is documentation rather than
+        a refactor, while the attribute name says what the number actually is.
+        """
+        return self.listings
+
+    @found.setter
+    def found(self, value: int) -> None:
+        self.listings = value
+
+    def record_entry(self) -> None:
+        """Register one listing entry served, before it is validated."""
+        self.entries += 1
+
+    def record_unidentified(self) -> None:
+        """Register a served entry whose reference could not be read."""
+        self.unidentified += 1
+
+    def record_seen(self, identifier: str) -> None:
+        """Register one distinct record as accounted for.
+
+        Called for every record whatever its fate -- scraped, skipped or failed --
+        because the question this answers is "did we account for all 234?", not
+        "did we succeed on all 234?".
+        """
+        self.seen.add(identifier)
 
     def record_failure(
         self,
@@ -158,21 +229,68 @@ class PartitionCounters:
             "identifier": identifier,
         }
         self.failures.append(entry)
+        if identifier:
+            self.seen.add(identifier)
         get_logger(__name__).error(
             "record.failed",
             extra={"body": self.body, "partition_key": self.partition_key, **entry},
         )
 
     def as_dict(self) -> dict[str, Any]:
+        """Summary for one partition, with reconciliation split into two checks.
+
+        ``listings_found`` is what the site advertised; ``records_distinct`` is
+        how many decisions that turned out to be. They are not the same number,
+        because the source's page windows overlap, so one check cannot cover
+        both questions:
+
+        * **listings_reconciled** -- did we see every decision the site
+          advertised? ``listings_found == records_distinct``. A shortfall means
+          decisions were advertised and never served to us, which on this source
+          happens when a page window overlaps its predecessor and displaces them.
+          ``duplicate_listings`` says how much overlap occurred, and is therefore
+          the explanation for the shortfall rather than an excuse for it.
+        * **records_reconciled** -- was every decision we did see accounted for?
+          ``records_distinct == scraped + skipped + failed``. A shortfall means we
+          found a decision and then lost it in our own pipeline.
+
+        Splitting them says WHERE to look: the first points at fetching, the
+        second at storage. ``reconciled`` is the conjunction, so callers that
+        just want a verdict still have one.
+        """
+        distinct = len(self.seen)
+        operations = self.scraped + self.skipped + self.failed
+
+        # Entries the site served more than once. NOT benign: a repeat occupies a
+        # slot that a real decision would have filled, so this is the mechanism
+        # by which records go missing on this source.
+        duplicate_listings = max(self.entries - self.unidentified - distinct, 0)
+        # Advertised decisions we never saw, whatever the cause -- displaced by
+        # overlap, or simply never served.
+        listings_unaccounted = max(self.listings - distinct, 0)
+        # Distinct decisions we parsed but never resolved to an outcome.
+        records_unaccounted = max(distinct - operations, 0)
+
         return {
             "body": self.body,
             "partition_key": self.partition_key,
-            "records_found": self.found,
+            # Kept under the original name as well: it is the number the brief's
+            # "records found" refers to, and renaming it would silently change
+            # the meaning of every log already collected.
+            "records_found": self.listings,
+            "listings_found": self.listings,
             "records_scraped": self.scraped,
             "records_skipped_unchanged": self.skipped,
             "records_failed": self.failed,
-            # Reconciliation check the brief asks for: found == scraped + skipped + failed.
-            "reconciled": self.found == self.scraped + self.skipped + self.failed,
+            "records_distinct": distinct,
+            "listings_served": self.entries,
+            "duplicate_listings": duplicate_listings,
+            "listings_unidentified": self.unidentified,
+            "listings_unaccounted": listings_unaccounted,
+            "records_unaccounted": records_unaccounted,
+            "listings_reconciled": listings_unaccounted == 0,
+            "records_reconciled": records_unaccounted == 0,
+            "reconciled": listings_unaccounted == 0 and records_unaccounted == 0,
         }
 
     def emit_summary(self) -> None:

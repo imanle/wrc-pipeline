@@ -56,6 +56,7 @@ from ..storage import objectstore as store
 from ..storage.mongo import WriteOutcome
 from ..storage.objectstore import ObjectStoreError
 from .items import DocumentRecord, RecordStatus
+from .spiders.wrc_decisions import partition_size_value
 
 log = get_logger(__name__)
 
@@ -113,7 +114,7 @@ class DocumentDownloadPipeline:
             run_id=self.run_id,
             start_date=spider.start_date,
             end_date=spider.end_date,
-            partition_size=str(spider.partition_size),
+            partition_size=partition_size_value(spider.partition_size),
             bodies=[body.slug for body in spider.bodies],
             settings=self.cfg,
         )
@@ -130,6 +131,12 @@ class DocumentDownloadPipeline:
             "records_scraped": 0,
             "records_skipped_unchanged": 0,
             "records_failed": 0,
+            "records_distinct": 0,
+            "listings_served": 0,
+            "duplicate_listings": 0,
+            "listings_unidentified": 0,
+            "listings_unaccounted": 0,
+            "records_unaccounted": 0,
         }
         for counters in getattr(spider, "counters", {}).values():
             summary = counters.as_dict()
@@ -137,11 +144,13 @@ class DocumentDownloadPipeline:
                 totals[field] += summary[field]
 
         totals["partitions"] = len(getattr(spider, "counters", {}))
+        # Two checks, because the site's stated total counts listing entries
+        # while records_distinct counts decisions, and its page windows overlap.
+        # See PartitionCounters.as_dict().
+        totals["listings_reconciled"] = totals["listings_unaccounted"] == 0
+        totals["records_reconciled"] = totals["records_unaccounted"] == 0
         totals["reconciled"] = (
-            totals["records_found"]
-            == totals["records_scraped"]
-            + totals["records_skipped_unchanged"]
-            + totals["records_failed"]
+            totals["listings_reconciled"] and totals["records_reconciled"]
         )
 
         status = "completed" if totals["reconciled"] else "completed_with_discrepancies"
@@ -193,6 +202,14 @@ class DocumentDownloadPipeline:
         # --- store the bytes ---------------------------------------------- #
         extension = self._resolve_extension(item, response)
 
+        # Change detection compares this, not the raw bytes. Every WRC page ends
+        # with `<!-- Elapsed time: 0.046756 -->`, regenerated per request, so a
+        # raw byte hash reported all 234 January documents as amended on the
+        # second run. The stored file is still the page exactly as fetched.
+        content_hash = store.sha256_bytes(
+            self.cfg.scraping.strip_volatile(response.body)
+        )
+
         try:
             stored = store.put_landing_document(
                 body_slug=item.body_slug,
@@ -204,6 +221,7 @@ class DocumentDownloadPipeline:
                 # -- see the no-local-storage notes in scrapy_settings.py.
                 data=response.body,
                 source_url=item.document_url,
+                key_hash=content_hash,
                 settings=self.cfg,
             )
         except ObjectStoreError as exc:
@@ -242,6 +260,7 @@ class DocumentDownloadPipeline:
                 "key": stored.key,
                 "file_hash": stored.file_hash,
                 "file_size": stored.file_size,
+                "content_hash": stored.content_hash,
                 "object_outcome": stored.outcome.value,
                 "record_outcome": outcome.value,
             },
@@ -301,6 +320,7 @@ class DocumentDownloadPipeline:
         record = item.model_copy(
             update={
                 "file_hash": existing.get("file_hash"),
+                "content_hash": existing.get("content_hash"),
                 "file_path": existing.get("file_path"),
                 "file_bucket": self.cfg.s3.landing_bucket,
                 "status": RecordStatus.SKIPPED,

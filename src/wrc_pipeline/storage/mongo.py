@@ -206,7 +206,19 @@ def find_existing(
     """
     return landing_collection(settings).find_one(
         {"body_slug": body_slug, "identifier": identifier},
-        projection={"file_hash": 1, "file_path": 1, "versions": 1},
+        # Every field the download pipeline needs before fetching: the hashes for
+        # change detection, the path to carry forward on a skip, and the HTTP
+        # validators for a conditional request. Omitting a field here silently
+        # disables the feature that reads it -- etag/last_modified were missing
+        # at first, which made conditional requests dead code.
+        projection={
+            "file_hash": 1,
+            "content_hash": 1,
+            "file_path": 1,
+            "etag": 1,
+            "last_modified": 1,
+            "versions": 1,
+        },
     )
 
 
@@ -229,7 +241,19 @@ def upsert_landing_record(
     key = {"body_slug": record["body_slug"], "identifier": record["identifier"]}
     now = _utcnow()
 
-    existing = collection.find_one(key, projection={"file_hash": 1, "versions": 1})
+    # file_path is REQUIRED here, not optional: it is copied into the versions
+    # entry below, and a projection that omits it silently writes a null path for
+    # every superseded version -- the object survives in the bucket but nothing
+    # records where it is, which defeats the point of keeping history.
+    #
+    # This is the second bug of exactly this shape (find_existing omitted
+    # etag/last_modified, which made conditional requests dead code). A projection
+    # is a contract with the code below it: whenever you read a field from
+    # `existing`, check it is listed here.
+    existing = collection.find_one(
+        key,
+        projection={"file_hash": 1, "file_path": 1, "content_hash": 1, "versions": 1},
+    )
 
     # --- unchanged -------------------------------------------------------- #
     if existing and existing.get("file_hash") == record.get("file_hash"):
@@ -249,6 +273,7 @@ def upsert_landing_record(
         previous_version = {
             "file_hash": existing.get("file_hash"),
             "file_path": existing.get("file_path"),
+            "content_hash": existing.get("content_hash"),
             "superseded_at": now,
         }
         collection.update_one(

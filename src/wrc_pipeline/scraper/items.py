@@ -119,18 +119,14 @@ class DocumentRecord(BaseModel):
     # get_bytes(bucket, key) directly instead of string-parsing a URI apart.
     file_bucket: str | None = None
     file_path: str | None = None
-    file_hash: str | None = None  # full 64-char SHA-256
+    file_hash: str | None = None  # SHA-256 of the bytes stored (requirement 8)
+    # SHA-256 after per-request noise is stripped. Stored because it, not
+    # file_hash, is what makes change detection stable: these pages carry an
+    # ASP.NET render timer, so their raw bytes differ on every fetch.
+    content_hash: str | None = None
     file_ext: str | None = None
     content_type: str | None = None
     file_size: int | None = Field(default=None, ge=0)
-    # HTTP validators from the download, kept so the NEXT run can issue a
-    # conditional request (If-None-Match / If-Modified-Since). A 304 then means
-    # "unchanged" without transferring the body -- the only way to satisfy both
-    # halves of requirement 9, which asks us not to re-download unchanged files
-    # AND to use the file hash to detect changes. A hash requires the bytes; a
-    # validator does not.
-    etag: str | None = None
-    last_modified: str | None = None
 
     # --- run bookkeeping --------------------------------------------------- #
     status: RecordStatus = RecordStatus.PENDING
@@ -225,6 +221,7 @@ class DocumentRecord(BaseModel):
                 "file_bucket": stored.bucket,
                 "file_path": stored.key,
                 "file_hash": stored.file_hash,
+                "content_hash": stored.content_hash,
                 "file_size": stored.file_size,
                 "content_type": stored.content_type,
                 "status": status,

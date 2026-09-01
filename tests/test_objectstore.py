@@ -281,6 +281,34 @@ def test_curated_upload_overwrites_at_a_stable_key(live_s3, live_settings):
     assert store.get_bytes(second.bucket, second.key, live_settings) == b"<p>clean v2</p>"
 
 
+def test_key_hash_controls_the_key_not_the_reported_hash(live_s3, live_settings):
+    """Bytes that differ only in per-request noise must map to one key, while
+    file_hash still describes what was actually stored."""
+    first = store.put_landing_document(
+        "wrc", "2024-06", "ADJ-00055555", ".html", b"decision <!-- t: 1 -->",
+        key_hash="c" * 64, settings=live_settings,
+    )
+    second = store.put_landing_document(
+        "wrc", "2024-06", "ADJ-00055555", ".html", b"decision <!-- t: 2 -->",
+        key_hash="c" * 64, settings=live_settings,
+    )
+
+    assert first.key == second.key
+    assert second.outcome is UploadOutcome.SKIPPED_UNCHANGED
+    # The skip reports the hash of the STORED copy (the first version), read from
+    # the object's own metadata -- not the hash of the bytes just fetched.
+    assert second.file_hash == first.file_hash
+    assert second.file_hash == store.sha256_bytes(b"decision <!-- t: 1 -->")
+    assert second.content_hash == "c" * 64
+
+
+def test_without_key_hash_the_content_hash_is_the_file_hash(live_s3, live_settings):
+    stored = store.put_landing_document(
+        "wrc", "2024-07", "ADJ-00066666", ".html", b"plain", settings=live_settings
+    )
+    assert stored.content_hash == stored.file_hash
+
+
 def test_missing_object_reads_raise_not_return_none(live_s3, live_settings):
     """Absence on a read is a real failure -- the metadata record claimed this
     file exists. Returning None here would let a corrupt record pass silently."""
