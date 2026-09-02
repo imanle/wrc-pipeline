@@ -6,8 +6,7 @@ Two assets over the same partition space:
 
 Partitioning
 ------------
-``MultiPartitionsDefinition`` of (body x period), where the period size comes
-from ``partitions.size`` in config. That is not a presentation
+``MultiPartitionsDefinition`` of (body x week). That is not a presentation
 choice -- it is the pipeline's actual unit of work, and has been since the
 spider was written: ``PartitionCounters`` is keyed on ``(body, partition_key)``,
 object keys embed both, and a single one can be re-run in isolation. Expressing
@@ -57,14 +56,11 @@ from typing import Any
 from dagster import (
     AssetExecutionContext,
     Backoff,
-    DailyPartitionsDefinition,
     MaterializeResult,
     MetadataValue,
-    MonthlyPartitionsDefinition,
     MultiPartitionsDefinition,
     RetryPolicy,
     StaticPartitionsDefinition,
-    TimeWindowPartitionsDefinition,
     WeeklyPartitionsDefinition,
     asset,
 )
@@ -94,50 +90,21 @@ WEEK_START_DAY = 1
 _settings = get_settings()
 
 
-def build_time_partitions(
-    size: PartitionSize,
-    start_date: date,
-) -> TimeWindowPartitionsDefinition:
-    """The Dagster time-partition definition matching a configured size.
-
-    Driven by ``partitions.size`` so ``config.yaml`` is genuinely authoritative.
-    Without this the config claimed to control partition size while the
-    orchestrator was hardcoded to weekly -- the sort of inconsistency that makes
-    every other config value suspect.
-
-    Note what changing this costs: Dagster stores materialisation state per
-    partition KEY, and the keys differ by size ("2024-01-29" weekly versus
-    "2024-01-01" monthly). Switching size therefore discards the history of the
-    old granularity rather than converting it. That is why this is a
-    deployment-time setting read once at load, not a per-run parameter -- and
-    why the CLI keeps its own ``--partition-size`` flag for ad-hoc runs.
-
-    Quarterly and yearly have no dedicated Dagster class, so they are built from
-    cron expressions; the resulting keys are still the window's first day, which
-    is what ``window_for`` expects.
-    """
-    start = start_date.isoformat()
-
-    if size is PartitionSize.DAILY:
-        return DailyPartitionsDefinition(start_date=start)
-    if size is PartitionSize.WEEKLY:
-        return WeeklyPartitionsDefinition(start_date=start, day_offset=WEEK_START_DAY)
-    if size is PartitionSize.MONTHLY:
-        return MonthlyPartitionsDefinition(start_date=start)
-    if size is PartitionSize.QUARTERLY:
-        return TimeWindowPartitionsDefinition(
-            cron_schedule="0 0 1 1,4,7,10 *", start=start, fmt="%Y-%m-%d"
-        )
-    if size is PartitionSize.YEARLY:
-        return TimeWindowPartitionsDefinition(
-            cron_schedule="0 0 1 1 *", start=start, fmt="%Y-%m-%d"
-        )
-
-    raise ValueError(f"unhandled partition size: {size!r}")
-
-
 BODY_PARTITIONS = StaticPartitionsDefinition([body.slug for body in _settings.scraping.bodies])
-TIME_PARTITIONS = build_time_partitions(_settings.partitions.size, _settings.partitions.start_date)
+# WEEKLY, pinned. Chosen empirically: a month of WRC results is 24 pages and the
+# site's page windows overlap non-deterministically at boundaries, which loses
+# records (see ARCHITECTURE.md); a week is roughly six pages. The orchestrator's
+# grid is also a deployment decision rather than a per-run one -- Dagster stores
+# materialisation state per partition KEY, and the keys differ by size
+# ("2024-01-29" weekly versus "2024-01-01" monthly), so changing granularity
+# orphans every recorded materialisation instead of converting it.
+#
+# Ad-hoc runs at other sizes go through the CLI, which takes --partition-size.
+PARTITION_SIZE = PartitionSize.WEEKLY
+TIME_PARTITIONS = WeeklyPartitionsDefinition(
+    start_date=_settings.partitions.start_date.isoformat(),
+    day_offset=WEEK_START_DAY,
+)
 DOCUMENT_PARTITIONS = MultiPartitionsDefinition(
     {"body": BODY_PARTITIONS, TIME_DIMENSION: TIME_PARTITIONS}
 )
@@ -148,22 +115,18 @@ DOCUMENT_PARTITIONS = MultiPartitionsDefinition(
 INGEST_RETRY = RetryPolicy(max_retries=2, delay=30, backoff=Backoff.LINEAR)
 
 
-def _dimensions(
-    context: AssetExecutionContext,
-    settings: Settings | None = None,
-) -> tuple[str, date, date, str]:
+def _dimensions(context: AssetExecutionContext) -> tuple[str, date, date, str]:
     """Unpack a multi-partition key into (body, start, end, internal_key).
 
     The time dimension gives the window's first day; its end and the pipeline's
-    own key both come from ``partitions.window_for`` at the configured size.
-    Deriving them there rather than here is deliberate -- the spider computes the
-    same key from the same function, and two implementations of "which week is
-    this" would eventually disagree by a day.
+    own key both come from ``partitions.window_for``. Deriving them there rather
+    than here is deliberate -- the spider computes the same key from the same
+    function, and two implementations of "which week is this" would eventually
+    disagree by a day.
     """
-    cfg = settings or get_settings()
     keys = context.partition_key.keys_by_dimension
     start = datetime.strptime(keys[TIME_DIMENSION], "%Y-%m-%d").date()
-    window = window_for(start, cfg.partitions.size)
+    window = window_for(start, PARTITION_SIZE)
     return keys["body"], window.start, window.end, window.key
 
 
@@ -209,7 +172,7 @@ def landing_documents(context: AssetExecutionContext) -> MaterializeResult:
     incomplete, and the only way to complete it is to fetch again.
     """
     settings = get_settings()
-    body_slug, start, end, partition_key = _dimensions(context, settings)
+    body_slug, start, end, partition_key = _dimensions(context)
 
     command = [
         sys.executable,
@@ -221,10 +184,10 @@ def landing_documents(context: AssetExecutionContext) -> MaterializeResult:
         end.isoformat(),
         "--bodies",
         body_slug,
-        # The crawl is told the same size the Dagster grid was built from, so a
-        # partition's window and its internal key agree end to end.
+        # The same size the grid was built from, so a partition's window and its
+        # internal key agree end to end.
         "--partition-size",
-        settings.partitions.size.value,
+        PARTITION_SIZE.value,
     ]
 
     context.log.info("crawling %s %s: %s", body_slug, partition_key, " ".join(command))
@@ -279,7 +242,7 @@ def curated_documents(context: AssetExecutionContext) -> MaterializeResult:
     subprocess, and an exception here surfaces with its traceback intact.
     """
     settings = get_settings()
-    body_slug, start, end, partition_key = _dimensions(context, settings)
+    body_slug, start, end, partition_key = _dimensions(context)
 
     counters = transform_range(start, end, body_slug, settings)
     summary = counters.as_dict()

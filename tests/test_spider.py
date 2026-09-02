@@ -257,6 +257,34 @@ def test_zero_results_is_not_a_failure(cfg, partition):
     assert spider.counters[("wrc", "2024-01")].failed == 0
 
 
+def test_the_sites_no_results_page_is_an_empty_partition_not_a_failure(cfg, partition):
+    """An empty search renders a message instead of a count line, so this page
+    has no "Shows ... of N" at all -- yet it is a complete, verified zero.
+
+    Live consequence before this worked: four Employment Appeals Tribunal
+    partitions for 2024 weeks failed with `partition.no_baseline` and exhausted
+    their Dagster retries, for a body that has no decisions that recent.
+    """
+    spider = _spider(cfg)
+    body = (
+        b"<html><body><div id='searchResult'>"
+        b"There are no search results fitting your keywords"
+        b"</div></body></html>"
+    )
+    response = HtmlResponse(
+        url=SEARCH_URL, body=body, encoding="utf-8", request=Request(url=SEARCH_URL)
+    )
+
+    output = list(spider.parse_listing(response, "wrc", partition, 1))
+    counters = spider.counters[("wrc", "2024-01")]
+
+    assert output == []
+    assert counters.found == 0
+    assert counters.failed == 0
+    assert spider.unreconcilable == []
+    assert counters.as_dict()["reconciled"] is True
+
+
 def test_comma_formatted_total_is_parsed(cfg, partition):
     """The site renders large totals as '62,789'."""
     spider = _spider(cfg)

@@ -6,7 +6,7 @@
 
 mongo:
   uri: "${MONGO_URI:-mongodb://wrc:wrc_password@localhost:27017/?authSource=admin}"
-  database: "${MONGO_DATABASE:-decisions}"
+  database: "${MONGO_DATABASE:-wrc}"
   landing_collection: "documents_landing"
   curated_collection: "documents_curated"
   runs_collection: "pipeline_runs"
@@ -18,8 +18,8 @@ s3:
   access_key: "${S3_ACCESS_KEY:-minioadmin}"
   secret_key: "${S3_SECRET_KEY:-minioadmin}"
   region: "${S3_REGION:-us-east-1}"
-  landing_bucket: "${S3_LANDING_BUCKET:-decisions-landing}"
-  curated_bucket: "${S3_CURATED_BUCKET:-decisions-curated}"
+  landing_bucket: "${S3_LANDING_BUCKET:-wrc-landing}"
+  curated_bucket: "${S3_CURATED_BUCKET:-wrc-curated}"
   # Key template for the landing zone. The hash suffix is what makes the zone
   # append-only: a changed document lands beside its predecessor, never over it.
   landing_key_template: "{body_slug}/{partition_key}/{identifier}__{hash_prefix}{ext}"
@@ -137,9 +137,15 @@ scraping:
   # Regex over "Shows 1 to 10 of 234 results". Group 3 is the reconciliation
   # baseline for records_found (requirement 10).
   result_count_pattern: "Shows\\s+(\\d+)\\s+to\\s+(\\d+)\\s+of\\s+([\\d,]+)\\s+results"
+  # An empty search renders this INSTEAD of the count line (confirmed against
+  # &body=2 for a 2024 week: zero `li.each-item` blocks, no "Shows ... of N").
+  # Matching it positively means an empty partition reports records_found: 0 and
+  # succeeds, while a page whose count we simply cannot read still fails hard --
+  # the two must not collapse into each other.
+  no_results_pattern: "There are no search results"
   # Guard against a runaway pager if the count text ever fails to parse.
   max_pages_per_partition: ${MAX_PAGES_PER_PARTITION:-500}
-  user_agent: "${SCRAPY_USER_AGENT:-wrc-research-crawler/1.0 (+contact: imannelbanna@gmail.com)}"
+  user_agent: "${SCRAPY_USER_AGENT:-wrc-research-crawler/1.0 (+contact: you@example.com)}"
   concurrent_requests: ${SCRAPY_CONCURRENT_REQUESTS:-16}
   concurrent_requests_per_domain: ${SCRAPY_CONCURRENT_PER_DOMAIN:-8}
   download_delay: ${SCRAPY_DOWNLOAD_DELAY:-0.25}
@@ -175,25 +181,25 @@ scraping:
       slug: "wrc"
       value: "15376"
       earliest_date: "2015-10-01"
-      identifier_pattern: "^(ADJ|IR)[- ]?.*"
+      identifier_pattern: "(?i)^(ADJ|IR)[- ]?.*"
 
     - name: "Labour Court"
       slug: "labour-court"
       value: "3"
       earliest_date: "1986-10-01"
-      identifier_pattern: "^[A-Z]{2,4}[-/ ]?[0-9/]+$"
+      identifier_pattern: "(?i)^[A-Z]{2,4}[-/ ]?[0-9/]+$"
 
     - name: "Equality Tribunal"
       slug: "equality-tribunal"
       value: "1"
       earliest_date: "1996-01-01"
-      identifier_pattern: "^(DEC-[A-Z][0-9]{4}-[0-9]+|[A-Z]{2}/[0-9]{4}/[0-9]+)$"
+      identifier_pattern: "(?i)^(DEC-[A-Z][0-9]{4}-[0-9]+|[A-Z]{2}/[0-9]{4}/[0-9]+)$"
 
     - name: "Employment Appeals Tribunal"
       slug: "employment-appeals-tribunal"
       value: "2"
       earliest_date: "2007-01-01"
-      identifier_pattern: "^([0-9]{3,6}|[A-Z]{2}[0-9]+/[0-9]{4})$"
+      identifier_pattern: "(?i)^([0-9]{3,6}|[A-Z]{2}[0-9]+/[0-9]{4})$"
 
   # Per-request noise, stripped before computing the CONTENT hash used for change
   # detection and for the landing object key. The stored file is never modified.
@@ -202,16 +208,8 @@ scraping:
   # timer, e.g. `<!-- Elapsed time: 0.046756 -->`. It differs on every fetch, so
   # a raw byte hash made all 234 January documents look amended on the second
   # run -- 234 spurious uploads and 234 spurious `versions` entries.
-  # Two observed so far, both HTML comments appended after </html>:
-  #   <!-- Elapsed time: 0.5885244 -->              server render time
-  #   <!-- cached or not being index.aspx page -->  present only on a cache hit,
-  #                                                 alongside "Elapsed time: 0"
-  # Listed individually rather than stripping everything after </html>: a broad
-  # rule would silently absorb a third variant, and a spurious version is a
-  # better outcome than not noticing the source changed.
   volatile_content_patterns:
     - "<!--\\s*Elapsed time:[^>]*-->"
-    - "<!--\\s*cached or not being[^>]*-->"
 
   # Labour Court and Equality Tribunal references contain forward slashes
   # (e.g. CD/12/572, EE/2006/040). The brief requires files be renamed to

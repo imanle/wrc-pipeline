@@ -272,3 +272,54 @@ def test_run_lifecycle_records_totals(settings):
     assert stored["status"] == "completed"
     assert stored["totals"]["records_scraped"] == 234
     assert "finished_at" in stored
+
+
+def test_alternating_versions_do_not_grow_the_list(settings):
+    """The WRC republishes some decisions under the same reference.
+
+    ADJ-00044064 exists at /2024/january/... and again at /2024/february/... with
+    heavier anonymisation, and each week's search returns its own copy -- so the
+    "current" version flips depending on which partition ran last. An
+    unconditional push appended an entry on every flip: four live passes produced
+    four version entries for two actual files, including the current one, and the
+    array would grow without limit.
+    """
+    january = _record(file_hash="hash-jan")
+    february = _record(file_hash="hash-feb")
+
+    for record in (january, february, january, february, january, february):
+        mongo_store.upsert_landing_record(record, settings)
+
+    stored = mongo_store.landing_collection(settings).find_one({"identifier": "ADJ-00054658"})
+    hashes = [v["file_hash"] for v in stored["versions"]]
+
+    # One entry, however many times the two alternate: the other version is
+    # current, so only its predecessor is history.
+    assert hashes == ["hash-jan"]
+    assert stored["file_hash"] == "hash-feb"
+
+
+def test_a_genuine_progression_keeps_every_version(settings):
+    """The dedupe must not cost real history: three distinct contents in
+    sequence leave two superseded versions."""
+    for h in ("hash-aaa", "hash-bbb", "hash-ccc"):
+        mongo_store.upsert_landing_record(_record(file_hash=h), settings)
+
+    stored = mongo_store.landing_collection(settings).find_one({"identifier": "ADJ-00054658"})
+    assert stored["file_hash"] == "hash-ccc"
+    assert [v["file_hash"] for v in stored["versions"]] == ["hash-aaa", "hash-bbb"]
+
+
+def test_the_current_version_is_not_listed_as_a_previous_one(settings):
+    """`versions` holds superseded states only. The live data had the current
+    file_hash appearing in its own version list, which makes "what did this look
+    like before?" unanswerable."""
+    mongo_store.upsert_landing_record(_record(file_hash="hash-aaa"), settings)
+    mongo_store.upsert_landing_record(_record(file_hash="hash-bbb"), settings)
+    mongo_store.upsert_landing_record(_record(file_hash="hash-aaa"), settings)
+
+    stored = mongo_store.landing_collection(settings).find_one({"identifier": "ADJ-00054658"})
+    current = stored["file_hash"]
+    assert current == "hash-aaa"
+    assert stored["versions"], "the superseded version should still be recorded"
+    assert current not in [v["file_hash"] for v in stored["versions"]]

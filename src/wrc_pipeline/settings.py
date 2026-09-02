@@ -221,9 +221,12 @@ class ScrapingSettings(BaseModel):
     date_display_format: str = "%d/%m/%Y"
     # Confirmed by recon: &pageNumber=2, 1-based, omitted for page 1.
     page_param: str = "pageNumber"
-    result_count_pattern: str = (
-        r"Shows\s+(\d+)\s+to\s+(\d+)\s+of\s+([\d,]+)\s+results"
-    )
+    result_count_pattern: str = r"Shows\s+(\d+)\s+to\s+(\d+)\s+of\s+([\d,]+)\s+results"
+    # Positive marker for an empty result set, which the site renders INSTEAD of
+    # a count line. Distinguishing "the site says zero" from "we could not read
+    # the count" is what lets an empty partition succeed while a broken selector
+    # still fails hard.
+    no_results_pattern: str = "There are no search results"
     max_pages_per_partition: int = Field(default=500, gt=0)
     page_size: int = Field(gt=0)
     user_agent: str
@@ -265,16 +268,34 @@ class ScrapingSettings(BaseModel):
     def parse_result_count(self, text: str) -> int | None:
         """Extract the total from ``Shows 1 to 10 of 234 results``.
 
-        Returns ``None`` when the phrase is absent, which the caller must treat
-        as a hard failure rather than "zero results": without a trustworthy
-        total there is no baseline to reconcile records_found against, and a
-        silently-truncated partition is the failure mode this whole pipeline is
-        designed to make impossible.
+        Three outcomes, and the distinction between the last two is the point:
+
+        * the count line parses -> that number is the baseline;
+        * no count line, but the site's explicit no-results message is present
+          -> ``0``, because zero IS a trustworthy baseline when the site says so;
+        * neither -> ``None``, which the caller must treat as a hard failure.
+
+        The third case is what this rule exists for: a page holding records whose
+        count we cannot read is unverifiable, and a silently-truncated partition
+        is the failure mode the whole pipeline is designed to make impossible.
+
+        Emptiness requires a POSITIVE signal rather than being inferred from the
+        absence of a count. Inferring it would collapse case three into case two
+        and turn a broken selector into a quiet "zero results" -- exactly the
+        failure the hard rule was written to prevent.
+
+        The empty case is real, not hypothetical: an Employment Appeals Tribunal
+        search for a 2024 week returns "There are no search results fitting your
+        keywords" with no count line, because that tribunal stopped issuing
+        decisions years ago. Before this, four such partitions failed and
+        exhausted their retries.
         """
         match = re.search(self.result_count_pattern, text)
-        if not match:
-            return None
-        return int(match.group(3).replace(",", ""))
+        if match:
+            return int(match.group(3).replace(",", ""))
+        if self.no_results_pattern and re.search(self.no_results_pattern, text, re.IGNORECASE):
+            return 0
+        return None
 
     def page_count(self, total_results: int) -> int:
         """Number of listing pages holding *total_results* records.

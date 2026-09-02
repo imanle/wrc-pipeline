@@ -9,7 +9,7 @@ from datetime import date
 
 import pytest
 
-from wrc_pipeline.partitions import Partition, generate_partitions, partition_count, window_for
+from wrc_pipeline.partitions import Partition, generate_partitions, partition_count
 from wrc_pipeline.settings import PartitionSize
 
 
@@ -98,31 +98,3 @@ def test_partition_is_frozen_and_hashable():
 
 def test_partition_count_matches_generator():
     assert partition_count(date(2020, 1, 1), date(2025, 1, 1), "yearly") == 6
-
-
-# --------------------------------------------------------------------------- #
-# window_for -- the single window the orchestrator asks about
-# --------------------------------------------------------------------------- #
-def test_window_for_matches_generate_partitions_for_every_size():
-    """The orchestrator is handed a partition-start date and derives the window
-    and key from this function; the spider derives the same key from
-    generate_partitions. Two implementations would eventually disagree by a day,
-    so they must be the same code path."""
-    for size in PartitionSize:
-        for partition in generate_partitions(date(2024, 1, 1), date(2025, 12, 31), size):
-            single = window_for(partition.start, size)
-            assert single.key == partition.key
-            assert single.start == partition.start
-
-
-def test_window_for_is_not_clamped_to_a_caller_range():
-    """A weekly window starting 29 January genuinely ends 4 February, even
-    though a request for "January" clamps it to the 31st. The orchestrator wants
-    the true window -- its partitions are not bounded by a month."""
-    clamped = list(generate_partitions(date(2024, 1, 29), date(2024, 1, 31), "weekly"))[0]
-    assert clamped.end == date(2024, 1, 31)
-    assert window_for(date(2024, 1, 29), "weekly").end == date(2024, 2, 4)
-
-
-def test_window_for_accepts_a_size_string():
-    assert window_for(date(2024, 1, 1), "monthly").key == "2024-01"

@@ -5,8 +5,6 @@ Scrapes documents and metadata from the Irish
 Decisions and Determinations database into a landing zone (MongoDB + object
 storage), then transforms them into a curated zone.
 
-**Status: work in progress.** See "Build progress" below.
-
 ---
 
 ## Prerequisites
@@ -39,16 +37,105 @@ docker compose ps                  # mongo + minio should be "healthy"
 MinIO console: <http://localhost:9001> (`minioadmin` / `minioadmin`)
 MongoDB: `mongodb://wrc:wrc_password@localhost:27017/?authSource=admin`
 
-## Verify the setup
+
+## Running the pipeline
+
+Three ways in. All of them use the same spider and the same settings.
+
+### 1. Scrape (command line)
 
 ```bash
-python -m pytest                   # unit tests
-python -c "from wrc_pipeline.settings import load_settings; print(load_settings().mongo.database)"
+# see the requests that would be made, fetch nothing
+python -m wrc_pipeline.cli --dry-run \
+  --start-date 2024-01-01 --end-date 2024-01-31 --bodies wrc
+
+# scrape one body for one month
+python -m wrc_pipeline.cli \
+  --start-date 2024-01-01 --end-date 2024-01-31 --bodies wrc
 ```
 
-> Use `python -m pytest` rather than bare `pytest`. A user-level pytest install
-> elsewhere on `PATH` can shadow the one in the venv and run under the wrong
-> interpreter; the `python -m` form always uses the active environment.
+Options: `--bodies` takes comma-separated slugs (`wrc`, `labour-court`,
+`equality-tribunal`, `employment-appeals-tribunal`) and defaults to all four.
+`--partition-size` takes `daily|weekly|monthly|quarterly|yearly`. Dates default
+to `RUN_START_DATE` / `RUN_END_DATE` in `.env`.
+
+**Exit code 0** means every partition is complete in the database. **1** means a
+partition is short and should be re-run — re-running is safe and only fetches
+what is missing.
+
+### 2. Transform
+
+```bash
+python -m wrc_pipeline.transform --start-date 2024-01-01 --end-date 2024-01-31
+```
+
+Reads landing metadata for the range, cleans each HTML document down to the
+decision itself, renames it to `identifier.ext`, and writes it to the curated
+bucket with a fresh hash. PDFs and DOCs are copied unchanged. Re-running skips
+anything already curated from the same source.
+
+### 3. Orchestrated (Dagster)
+
+```bash
+export DAGSTER_HOME="$PWD/.dagster_home"
+mkdir -p "$DAGSTER_HOME" && touch "$DAGSTER_HOME/dagster.yaml"
+dagster dev -p 3000
+```
+
+Then <http://localhost:3000> → **Jobs** → `ingest_and_transform` → **Partitions**
+→ **Materialize**.
+
+Two assets, `landing_documents` → `curated_documents`, partitioned by
+**(body x week)**. Pick one cell (e.g. body `wrc`, period `2024-01-01`) or a
+range of weeks (`[2024-01-01...2024-01-29]`). Dagster runs the two stages in
+order and retries a partition that comes back short.
+
+Without `DAGSTER_HOME` set, Dagster uses a temporary directory and forgets every
+run when it exits.
+
+## Looking at the results
+
+```bash
+# how many records, by partition
+python -c "
+from wrc_pipeline.storage import mongo
+from wrc_pipeline.settings import get_settings
+c = mongo.landing_collection(get_settings())
+print('records:', c.count_documents({}))
+for p in sorted(c.distinct('partition_key')):
+    print(' ', p, c.count_documents({'partition_key': p}))"
+
+# stored documents
+docker compose exec minio mc ls --recursive local/decisions-landing/ | wc -l
+
+# the run summary
+jq -c 'select(.event | endswith(".summary"))' logs/pipeline.jsonl | tail -3
+```
+
+MinIO console: <http://localhost:9001>. MongoDB Compass:
+`mongodb://wrc:wrc_password@localhost:27017/?authSource=admin`, database
+`decisions`.
+
+Logs are JSON, one object per line, in `logs/pipeline.jsonl`.
+
+## Known limitations
+
+- **The site's pagination overlaps.** Its search pages sometimes serve the same
+  record on two consecutive pages, which pushes other records off the results
+  entirely. Measured while fetching one page at a time, so it is not caused by
+  concurrency. The pipeline detects the shortfall and Dagster re-runs the
+  partition; details and numbers are in `ARCHITECTURE.md`.
+- **No PDFs in the tested range.** Every document sampled across three bodies
+  and 2010-2024 was HTML. The pass-through branch for PDF/DOC files is
+  implemented and unit-tested against synthetic files, but no live document has
+  exercised it.
+- **Conditional requests never fire against this source.** WRC sends no `ETag`
+  or `Last-Modified`, so the `304 Not Modified` path is unit-tested only. Change
+  detection falls back to comparing hashes, which is correct but re-downloads.
+- **Two tribunals no longer publish.** The Equality Tribunal and Employment
+  Appeals Tribunal stopped issuing decisions years ago, so recent partitions for
+  them are correctly empty. There is no per-body end date, so those partitions
+  are still crawled to discover that.
 
 ## Configuration
 
@@ -66,18 +153,19 @@ docker compose down -v             # stop and delete all data
 
 ---
 
-## Build progress
+## Where things go
 
-- [x] **Phase 0** — Recon: search endpoint, body IDs, pagination, HTML structure
-- [x] **Phase 1** — Config, JSON logging, date partitioning, Docker storages, tests
-- [ ] **Phase 2** — Storage clients (Mongo, S3) and item schema
-- [ ] **Phase 3** — Scrapy spider: body x partition x page
-- [ ] **Phase 4** — Download pipeline, hashing, idempotency
-- [ ] **Phase 5** — Run summaries and reconciliation
-- [ ] **Phase 6** — Transformation script (HTML cleaning, curated zone)
-- [ ] **Phase 7** — Dagster orchestration
-- [ ] **Phase 8** — ARCHITECTURE.md
-- [ ] **Phase 9** — Full run at evaluation volume + idempotency proof
+| | Landing (raw) | Curated (cleaned) |
+|---|---|---|
+| Files | `decisions-landing` bucket | `decisions-curated` bucket |
+| Key | `wrc/2024-W05/ADJ-00054658__a3f9c1d4.html` | `wrc/ADJ-00054658.html` |
+| Metadata | `decisions.documents_landing` | `decisions.documents_curated` |
+
+Landing keys embed a hash of the file, so an amended decision lands beside the
+old version instead of replacing it. Nothing in the landing zone is ever
+overwritten. Also in MongoDB: `pipeline_runs` (one document per run, with totals)
+and `pipeline_failures` (every record that could not be fetched, with its reason
+and HTTP code).
 
 ## The source's URL contract (confirmed by recon)
 

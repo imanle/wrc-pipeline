@@ -294,11 +294,50 @@ def upsert_landing_record(
             "content_hash": existing.get("content_hash"),
             "superseded_at": now,
         }
+
+        # The version list is rebuilt rather than appended to, because content on
+        # this source does not only move forward.
+        #
+        # The WRC republishes some decisions under the same reference: the same
+        # case sits at /2024/january/adj-00044064.html and again at
+        # /2024/february/... with heavier anonymisation, and each week's search
+        # returns its own copy. So the "current" version flips back and forth
+        # depending on which partition ran last. An unconditional $push appended
+        # an entry on every flip -- four live passes produced four entries for two
+        # actual files, including one identical to the current version, and the
+        # array grew without limit.
+        #
+        # Two rules, which need the whole array rather than a $push:
+        #   1. a version already recorded is not recorded again;
+        #   2. the version that just became current is removed from the history,
+        #      since `versions` holds superseded states only.
+        #
+        # $addToSet cannot do (1) -- it compares whole subdocuments and
+        # superseded_at differs every time -- and (2) needs a $pull, which cannot
+        # share a field with a $push in one update.
+        history = [
+            v
+            for v in (existing.get("versions") or [])
+            # drop any entry matching the NEW current content (rule 2)
+            if v.get("file_hash") != record.get("file_hash")
+        ]
+        if previous_version["file_hash"] not in {v.get("file_hash") for v in history}:
+            history.append(previous_version)  
+
+        # Rewriting the array is a last-write-wins operation, so two workers
+        # updating the SAME identifier at the same moment could drop one entry.
+        # Accepted: partitions are the unit of concurrency and an identifier
+        # belongs to one partition, so this only arises for the republished
+        # documents above, where both versions are still safe in object storage.
         collection.update_one(
             key,
             {
-                "$set": {**record, "last_seen_at": now, "content_changed_at": now},
-                "$push": {"versions": previous_version},
+                "$set": {
+                    **record,
+                    "versions": history,
+                    "last_seen_at": now,
+                    "content_changed_at": now,
+                }
             },
         )
         log.warning(

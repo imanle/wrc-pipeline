@@ -28,10 +28,10 @@ from wrc_pipeline.orchestration import assets as orchestration
 from wrc_pipeline.orchestration.assets import (
     BODY_PARTITIONS,
     DOCUMENT_PARTITIONS,
+    PARTITION_SIZE,
     TIME_DIMENSION,
     TIME_PARTITIONS,
     _dimensions,
-    build_time_partitions,
     curated_documents,
     landing_documents,
 )
@@ -90,38 +90,12 @@ def test_partitions_are_body_by_period():
     assert [d.name for d in DOCUMENT_PARTITIONS.partitions_defs] == ["body", TIME_DIMENSION]
 
 
-def test_the_time_dimension_matches_the_configured_size():
-    """config.yaml is authoritative. Before this, it claimed to control the
-    partition size while the orchestrator was hardcoded to weekly."""
-    expected = {
-        PartitionSize.DAILY: "DailyPartitionsDefinition",
-        PartitionSize.WEEKLY: "WeeklyPartitionsDefinition",
-        PartitionSize.MONTHLY: "MonthlyPartitionsDefinition",
-        PartitionSize.QUARTERLY: "TimeWindowPartitionsDefinition",
-        PartitionSize.YEARLY: "TimeWindowPartitionsDefinition",
-    }[load_settings().partitions.size]
-    assert type(TIME_PARTITIONS).__name__ == expected
-
-
-@pytest.mark.parametrize("size", list(PartitionSize))
-def test_every_configured_size_builds_a_definition(size):
-    """All five sizes the config accepts must actually work in the orchestrator,
-    not just the one currently selected."""
-    assert build_time_partitions(size, date(2024, 1, 1)) is not None
-
-
-@pytest.mark.parametrize("size", list(PartitionSize))
-def test_dagster_keys_round_trip_through_window_for(size):
-    """Every Dagster partition key must be a window start the pipeline
-    recognises. If they disagreed, the metadata query would count a partition
-    that does not exist -- and would report zero rather than raising."""
-    definition = build_time_partitions(size, date(2024, 1, 1))
-    keys = definition.get_partition_keys(current_time=datetime(2026, 1, 1))
-    assert keys, f"{size.value} produced no partitions"
-
-    for key in keys[:6]:
-        start = date.fromisoformat(key)
-        assert window_for(start, size).start == start
+def test_the_grid_is_weekly():
+    """Pinned rather than read from config: the granularity is a deployment
+    decision, and Dagster keys materialisation state by partition key, so
+    changing it would orphan recorded materialisations."""
+    assert PARTITION_SIZE is PartitionSize.WEEKLY
+    assert type(TIME_PARTITIONS).__name__ == "WeeklyPartitionsDefinition"
 
 
 def test_every_configured_body_is_a_partition():
@@ -138,9 +112,17 @@ def test_weeks_start_on_monday():
     would pair Dagster partition '2024-01-07' with internal key '2024-W01'
     covering different days -- an off-by-one that shows up only as quietly wrong
     counts."""
-    weekly = build_time_partitions(PartitionSize.WEEKLY, date(2024, 1, 1))
-    for key in weekly.get_partition_keys(current_time=datetime(2024, 2, 15))[:10]:
+    for key in TIME_PARTITIONS.get_partition_keys(current_time=datetime(2026, 1, 1))[:10]:
         assert date.fromisoformat(key).weekday() == 0, f"{key} is not a Monday"
+
+
+def test_every_dagster_key_is_a_window_start_the_pipeline_recognises():
+    """If the two disagreed, the metadata query would count a partition that does
+    not exist -- and would report zero rather than raising."""
+    keys = TIME_PARTITIONS.get_partition_keys(current_time=datetime(2026, 1, 1))
+    for key in keys[:20]:
+        start = date.fromisoformat(key)
+        assert window_for(start, PARTITION_SIZE).start == start
 
 
 # --------------------------------------------------------------------------- #
@@ -154,19 +136,13 @@ def test_dimensions_unpacks_body_window_and_internal_key():
     assert key == "2024-W02"
 
 
-def test_dimensions_follows_the_configured_size(monkeypatch):
-    """The window end and the internal key both come from the size in config, so
-    a monthly deployment gets a month-long window, not seven days."""
-    settings = load_settings()
-    monthly = settings.model_copy(
-        update={
-            "partitions": settings.partitions.model_copy(update={"size": PartitionSize.MONTHLY})
-        }
-    )
-    _, start, end, key = _dimensions(_context(period="2024-01-01"), monthly)
-
-    assert (start, end) == (date(2024, 1, 1), date(2024, 1, 31))
-    assert key == "2024-01"
+def test_a_window_spanning_a_month_boundary_is_not_clamped():
+    """A weekly window starting 29 January genuinely ends 4 February. Observed
+    live: that partition stored 78 records, where a January-clamped CLI run of
+    the same week stored 46."""
+    _, start, end, key = _dimensions(_context(period="2024-01-29"))
+    assert (start, end) == (date(2024, 1, 29), date(2024, 2, 4))
+    assert key == "2024-W05"
 
 
 def test_internal_keys_agree_with_generate_partitions():
@@ -199,9 +175,9 @@ def test_ingest_shells_out_with_the_partition_window(monkeypatch):
     assert "--start-date" in command and "2024-01-29" in command
     assert "--end-date" in command and "2024-02-04" in command
     assert "--bodies" in command and "wrc" in command
-    # The crawl is told the same size the grid was built from, so the window and
-    # the internal key agree end to end.
-    assert load_settings().partitions.size.value in command
+    # The same size the grid was built from, so the window and the internal key
+    # agree end to end.
+    assert "weekly" in command
 
 
 def test_ingest_reports_stored_records_as_metadata(monkeypatch):
