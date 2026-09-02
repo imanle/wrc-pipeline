@@ -222,6 +222,24 @@ def find_existing(
     )
 
 
+def count_partition_records(
+    body_slug: str,
+    partition_key: str,
+    settings: Settings | None = None,
+) -> int:
+    """How many distinct decisions we hold for one (body, partition).
+
+    The store, not the run. A single pass can miss records the previous pass
+    already captured -- this source's page windows overlap and displace entries
+    non-deterministically -- so "did this pass see all 234?" and "do we hold all
+    234?" are different questions, and only the second one decides whether the
+    partition needs re-running.
+    """
+    return landing_collection(settings).count_documents(
+        {"body_slug": body_slug, "partition_key": partition_key}
+    )
+
+
 def upsert_landing_record(
     record: dict[str, Any],
     settings: Settings | None = None,

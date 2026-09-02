@@ -121,6 +121,25 @@ def test_overlapping_listings_are_reported_as_loss():
     assert totals["reconciled"] is False
 
 
+def test_incomplete_partitions_asks_the_store_not_the_run(monkeypatch):
+    """A pass that saw 226 of 234 is not a failure if the store holds all 234."""
+    from wrc_pipeline import cli
+    from wrc_pipeline.storage import mongo
+
+    monkeypatch.setattr(mongo, "count_partition_records", lambda *a, **k: 234)
+    counters = {("wrc", "2024-01"): _counter(found=234, scraped=226, distinct=226, listings_seen=234)}
+    assert cli.incomplete_partitions(counters) == []
+
+
+def test_incomplete_partitions_reports_a_short_store(monkeypatch):
+    from wrc_pipeline import cli
+    from wrc_pipeline.storage import mongo
+
+    monkeypatch.setattr(mongo, "count_partition_records", lambda *a, **k: 200)
+    counters = {("wrc", "2024-01"): _counter(found=234, scraped=200, distinct=200, listings_seen=234)}
+    assert cli.incomplete_partitions(counters) == ["wrc/2024-01"]
+
+
 def test_a_clean_partition_exits_zero():
     counter = _counter(found=46, scraped=46, distinct=46, listings_seen=46)
     totals = totals_of({("wrc", "2024-01"): counter})

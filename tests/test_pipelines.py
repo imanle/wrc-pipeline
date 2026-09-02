@@ -81,9 +81,15 @@ class FakeSpider:
 class MongoSpy:
     """Stands in for the mongo module, recording every call."""
 
-    def __init__(self, existing: dict[str, Any] | None = None, outcome=WriteOutcome.INSERTED):
+    def __init__(
+        self,
+        existing: dict[str, Any] | None = None,
+        outcome=WriteOutcome.INSERTED,
+        stored_count: int = 0,
+    ):
         self.existing = existing
         self.outcome = outcome
+        self.stored_count = stored_count
         self.upserts: list[dict[str, Any]] = []
         self.failures: list[dict[str, Any]] = []
         self.runs: list[Any] = []
@@ -100,6 +106,11 @@ class MongoSpy:
 
     def ensure_indexes(self, settings=None):
         pass
+
+    def count_partition_records(self, body_slug, partition_key, settings=None):
+        """What the STORE holds, which the fake controls independently of what
+        this run saw -- that separation is the whole point of the method."""
+        return self.stored_count
 
     def start_run(self, **kwargs):
         self.runs.append(("start", kwargs))
@@ -557,7 +568,9 @@ def test_nothing_conclusive_defaults_to_html(cfg, monkeypatch, item):
 # --------------------------------------------------------------------------- #
 def test_close_spider_persists_reconciled_totals(cfg, monkeypatch, item):
     spider = FakeSpider()
-    pipeline, mongo_spy, _ = _pipeline(cfg, monkeypatch, _response())
+    pipeline, mongo_spy, _ = _pipeline(
+        cfg, monkeypatch, _response(), MongoSpy(stored_count=2)
+    )
 
     counters = spider.counters_for("wrc", "2024-01")
     counters.found = 2
@@ -578,22 +591,52 @@ def test_close_spider_persists_reconciled_totals(cfg, monkeypatch, item):
     assert totals["records_scraped"] == 1
     assert totals["records_skipped_unchanged"] == 1
     assert totals["records_distinct"] == 2
-    assert totals["reconciled"] is True
+    assert totals["records_in_store"] == 2
+    assert totals["store_complete"] is True
     assert status == "completed"
 
 
-def test_discrepancy_is_reflected_in_the_run_status(cfg, monkeypatch, item):
-    """A run where records vanished unexplained must not be recorded as clean."""
+def test_a_partition_the_store_is_short_on_is_incomplete(cfg, monkeypatch, item):
+    """Ten advertised, three held: the partition needs re-running."""
     spider = FakeSpider()
-    pipeline, mongo_spy, _ = _pipeline(cfg, monkeypatch, _response())
+    pipeline, mongo_spy, _ = _pipeline(
+        cfg, monkeypatch, _response(), MongoSpy(stored_count=3)
+    )
 
-    # Ten entries advertised, none served: real loss.
     spider.counters_for("wrc", "2024-01").found = 10
     pipeline.close_spider(spider)
 
     _, totals, status = mongo_spy.runs[-1]
-    assert totals["reconciled"] is False
-    assert status == "completed_with_discrepancies"
+    assert totals["records_in_store"] == 3
+    assert totals["store_complete"] is False
+    assert totals["partitions_incomplete"] == ["wrc/2024-01"]
+    assert status == "incomplete"
+
+
+def test_a_pass_that_missed_records_is_clean_if_the_store_is_complete(cfg, monkeypatch, item):
+    """The live case this exists for: a second run over January saw only 226 of
+    234 distinct decisions, because the site's page windows overlapped and
+    displaced 8. All 234 were already stored by the first run, so the store is
+    complete and the run is not a failure."""
+    spider = FakeSpider()
+    pipeline, mongo_spy, _ = _pipeline(
+        cfg, monkeypatch, _response(), MongoSpy(stored_count=234)
+    )
+
+    counters = spider.counters_for("wrc", "2024-01")
+    counters.found = 234
+    counters.entries = 234
+    for i in range(226):  # this pass saw 226 distinct
+        counters.record_seen(f"ADJ-{i:05d}")
+    counters.skipped = 226
+
+    pipeline.close_spider(spider)
+
+    _, totals, status = mongo_spy.runs[-1]
+    assert totals["records_distinct"] == 226  # the pass fell short...
+    assert totals["records_in_store"] == 234  # ...but the store did not
+    assert totals["store_complete"] is True
+    assert status == "completed"
 
 
 def test_non_record_items_pass_through(cfg, monkeypatch, item):

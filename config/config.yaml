@@ -139,7 +139,7 @@ scraping:
   result_count_pattern: "Shows\\s+(\\d+)\\s+to\\s+(\\d+)\\s+of\\s+([\\d,]+)\\s+results"
   # Guard against a runaway pager if the count text ever fails to parse.
   max_pages_per_partition: ${MAX_PAGES_PER_PARTITION:-500}
-  user_agent: "${SCRAPY_USER_AGENT:-wrc-research-crawler/1.0 (+contact: you@example.com)}"
+  user_agent: "${SCRAPY_USER_AGENT:-wrc-research-crawler/1.0 (+contact: imannelbanna@gmail.com)}"
   concurrent_requests: ${SCRAPY_CONCURRENT_REQUESTS:-16}
   concurrent_requests_per_domain: ${SCRAPY_CONCURRENT_PER_DOMAIN:-8}
   download_delay: ${SCRAPY_DOWNLOAD_DELAY:-0.25}

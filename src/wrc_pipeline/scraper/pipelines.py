@@ -138,10 +138,42 @@ class DocumentDownloadPipeline:
             "listings_unaccounted": 0,
             "records_unaccounted": 0,
         }
+        # Per-partition completeness, measured against the store rather than
+        # against this pass. A pass that missed 8 records is not a problem if a
+        # previous pass already stored them, and re-running until complete
+        # converges precisely because the two questions are separate.
+        partitions_incomplete: list[str] = []
+        records_in_store = 0
+
         for counters in getattr(spider, "counters", {}).values():
             summary = counters.as_dict()
             for field in totals:
                 totals[field] += summary[field]
+
+            held = mongo.count_partition_records(
+                counters.body, counters.partition_key, self.cfg
+            )
+            records_in_store += held
+            complete = held >= counters.listings
+            if not complete:
+                partitions_incomplete.append(f"{counters.body}/{counters.partition_key}")
+
+            log.info(
+                "partition.completeness",
+                extra={
+                    "body": counters.body,
+                    "partition_key": counters.partition_key,
+                    "listings_found": counters.listings,
+                    "records_in_store": held,
+                    "records_seen_this_run": summary["records_distinct"],
+                    "shortfall": max(counters.listings - held, 0),
+                    "complete": complete,
+                },
+            )
+
+        totals["records_in_store"] = records_in_store
+        totals["partitions_incomplete"] = partitions_incomplete
+        totals["store_complete"] = not partitions_incomplete
 
         totals["partitions"] = len(getattr(spider, "counters", {}))
         # Two checks, because the site's stated total counts listing entries
@@ -153,7 +185,10 @@ class DocumentDownloadPipeline:
             totals["listings_reconciled"] and totals["records_reconciled"]
         )
 
-        status = "completed" if totals["reconciled"] else "completed_with_discrepancies"
+        # The run's verdict is about the STORE. A pass that saw fewer records
+        # than the site advertised is only a problem if the store is still short
+        # afterwards; otherwise a previous pass already covered it.
+        status = "completed" if totals["store_complete"] else "incomplete"
         mongo.finish_run(self.run_id, totals, status=status, settings=self.cfg)
 
     # ------------------------------------------------------------------ #

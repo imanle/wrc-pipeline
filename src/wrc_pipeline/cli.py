@@ -78,6 +78,24 @@ def totals_of(counters: dict[Any, Any]) -> dict[str, int | bool]:
     return totals
 
 
+def incomplete_partitions(counters: dict[Any, Any]) -> list[str]:
+    """Partitions where the store holds fewer records than the site advertised.
+
+    This is the question a scheduler needs answered: re-run, or move on. Asked of
+    MongoDB rather than of the run's counters, because a partition can be
+    complete in the store even when the pass that just finished saw less than the
+    full set.
+    """
+    from .storage import mongo
+
+    short = []
+    for counter in counters.values():
+        held = mongo.count_partition_records(counter.body, counter.partition_key)
+        if held < counter.listings:
+            short.append(f"{counter.body}/{counter.partition_key}")
+    return short
+
+
 def dry_run(spider: Any) -> int:
     """List the planned start requests without making any."""
     for request in spider.start_requests():
@@ -130,6 +148,14 @@ def main(argv: list[str] | None = None) -> int:
 
     totals = totals_of(captured)
 
+    # Completeness of the STORE decides the exit code, not what this pass saw.
+    # The source's page windows overlap non-deterministically, so a pass can miss
+    # records a previous pass already stored; exiting non-zero on that would make
+    # a complete partition fail forever. Measured here rather than trusted from
+    # the counters, because the pipeline may not have run at all (--dry-run, or a
+    # crawl that failed before opening).
+    incomplete = incomplete_partitions(captured)
+
     # A crawl that planned requests and processed no partitions reconciles
     # trivially (0 == 0) and would otherwise exit 0. That is exactly how the
     # missing async start() hid itself on the first live run.
@@ -140,9 +166,18 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    if not totals["reconciled"]:
-        log.error("run.not_reconciled", extra=totals)
+    if incomplete:
+        log.error(
+            "run.incomplete",
+            extra={**totals, "partitions_incomplete": incomplete},
+        )
         return 1
+
+    if not totals["reconciled"]:
+        # The store is complete but this pass fell short -- worth knowing, not
+        # worth failing. Re-running converges, and nothing is missing.
+        log.warning("run.pass_incomplete", extra=totals)
+
     return 0
 
 

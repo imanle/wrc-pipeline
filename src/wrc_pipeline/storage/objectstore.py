@@ -408,10 +408,6 @@ def object_exists(bucket: str, key: str, settings: Settings | None = None) -> bo
 
 def get_bytes(bucket: str, key: str, settings: Settings | None = None) -> bytes:
     """Fetch an object into memory.
-
-    The transformation stage's read path. In-memory is the right call there:
-    BeautifulSoup needs the whole document anyway, and decisions are small. Use
-    :func:`download_to_path` for anything that might not be.
     """
     try:
         response = get_s3_client(settings).get_object(Bucket=bucket, Key=key)
