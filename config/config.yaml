@@ -6,7 +6,7 @@
 
 mongo:
   uri: "${MONGO_URI:-mongodb://wrc:wrc_password@localhost:27017/?authSource=admin}"
-  database: "${MONGO_DATABASE:-wrc}"
+  database: "${MONGO_DATABASE:-decisions}"
   landing_collection: "documents_landing"
   curated_collection: "documents_curated"
   runs_collection: "pipeline_runs"
