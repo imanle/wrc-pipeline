@@ -18,8 +18,8 @@ s3:
   access_key: "${S3_ACCESS_KEY:-minioadmin}"
   secret_key: "${S3_SECRET_KEY:-minioadmin}"
   region: "${S3_REGION:-us-east-1}"
-  landing_bucket: "${S3_LANDING_BUCKET:-wrc-landing}"
-  curated_bucket: "${S3_CURATED_BUCKET:-wrc-curated}"
+  landing_bucket: "${S3_LANDING_BUCKET:-decisions-landing}"
+  curated_bucket: "${S3_CURATED_BUCKET:-decisions-curated}"
   # Key template for the landing zone. The hash suffix is what makes the zone
   # append-only: a changed document lands beside its predecessor, never over it.
   landing_key_template: "{body_slug}/{partition_key}/{identifier}__{hash_prefix}{ext}"

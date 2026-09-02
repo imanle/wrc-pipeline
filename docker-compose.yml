@@ -58,8 +58,8 @@ services:
     environment:
       S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
       S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
-      LANDING_BUCKET: ${S3_LANDING_BUCKET:-wrc-landing}
-      CURATED_BUCKET: ${S3_CURATED_BUCKET:-wrc-curated}
+      LANDING_BUCKET: ${S3_LANDING_BUCKET:-decisions-landing}
+      CURATED_BUCKET: ${S3_CURATED_BUCKET:-decisions-curated}
     entrypoint: >
       /bin/sh -c "
       mc alias set local http://minio:9000 $$S3_ACCESS_KEY $$S3_SECRET_KEY &&
