@@ -21,9 +21,9 @@ Conventions
 from __future__ import annotations
 
 import calendar
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import Iterator
 
 from .settings import PartitionSize
 
@@ -135,6 +135,33 @@ def generate_partitions(
             size=size,
         )
         cursor = raw_end + _ONE_DAY
+
+
+def window_for(
+    window_start: date,
+    size: PartitionSize | str = PartitionSize.MONTHLY,
+) -> Partition:
+    """The single window beginning at *window_start*, at the given size.
+
+    Public because the Dagster layer needs exactly this: it is handed a
+    partition-start date and must derive the window's end and the pipeline's own
+    key. Doing that arithmetic there would duplicate ``_end_of_window`` and
+    ``_key_for``, and the copies would drift -- an ISO-week key paired with a
+    seven-day window computed a different way is an off-by-one waiting to
+    happen.
+
+    Unlike :func:`generate_partitions`, the end is NOT clamped to a caller's
+    range: a weekly window starting 29 January genuinely ends 4 February, even
+    though a request for "January" would have stopped at the 31st.
+    """
+    if isinstance(size, str):
+        size = PartitionSize(size)
+    return Partition(
+        start=window_start,
+        end=_end_of_window(window_start, size),
+        key=_key_for(window_start, size),
+        size=size,
+    )
 
 
 def partition_count(

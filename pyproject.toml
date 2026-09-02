@@ -43,3 +43,9 @@ addopts = "-q"
 python_version = "3.11"
 warn_unused_ignores = true
 ignore_missing_imports = true
+
+# Lets `dagster dev` find the code location with no arguments, instead of
+# requiring `-m wrc_pipeline.orchestration.definitions` every time.
+[tool.dagster]
+module_name = "wrc_pipeline.orchestration.definitions"
+code_location_name = "wrc_pipeline"
