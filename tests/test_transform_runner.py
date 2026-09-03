@@ -49,6 +49,7 @@ def _landing(**overrides: Any) -> dict[str, Any]:
         "body_slug": "wrc",
         "title": "ADJ-00047352",
         "description": "Car Valet V Motor Garage",
+        "case_number": "ADJ-00047352",
         "published_date": "2024-01-31",
         "partition_date": "2024-01-29",
         "partition_key": "2024-W05",
@@ -227,7 +228,17 @@ def test_landing_metadata_is_carried_forward(cfg, monkeypatch):
     transform_record(_landing(), TransformCounters(), cfg)
 
     curated = mongo_spy.upserts[0]
-    for field in ("identifier", "body_slug", "published_date", "partition_key", "description"):
+    for field in (
+        "identifier",
+        "body_slug",
+        "published_date",
+        "partition_key",
+        "description",
+        # Carried explicitly by name, so a field added to the record model does
+        # NOT reach the curated zone until it is listed. case_number was added
+        # after this list existed.
+        "case_number",
+    ):
         assert curated[field] == _landing()[field]
 
 

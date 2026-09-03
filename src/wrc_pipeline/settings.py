@@ -113,7 +113,7 @@ class S3Settings(BaseModel):
     max_attempts: int = Field(default=5, gt=0)
 
     @model_validator(mode="after")
-    def _distinct_buckets(self) -> "S3Settings":
+    def _distinct_buckets(self) -> S3Settings:
         # The brief is explicit that the landing zone is never mutated. Sharing a
         # bucket between zones is the easiest way to violate that by accident.
         if self.landing_bucket == self.curated_bucket:
@@ -127,7 +127,7 @@ class PartitionSettings(BaseModel):
     end_date: date
 
     @model_validator(mode="after")
-    def _ordered(self) -> "PartitionSettings":
+    def _ordered(self) -> PartitionSettings:
         if self.start_date > self.end_date:
             raise ValueError(
                 f"start_date ({self.start_date}) must not be after end_date ({self.end_date})"
@@ -149,6 +149,18 @@ class BodySettings(BaseModel):
     value: str
     earliest_date: date | None = None
     identifier_pattern: str | None = None
+    # Whether `span.refNO` holds the same reference as the title attribute.
+    #
+    # True for three bodies. FALSE for the Employment Appeals Tribunal, where the
+    # two fields are different identifiers: the title carries the statutory
+    # references ("RP1105/2008, MN1197/2008, WT527/2008") while refNO carries a
+    # numeric CASE number ("34007") shared across a group of claims -- one value
+    # appeared against 14 records in a sampled month. The site's own search
+    # offers "Decision Number" and "Case Number" as separate filters.
+    #
+    # Cross-checking them there compared two things that were never meant to
+    # agree, and failed all 216 records in a month.
+    crosscheck_identifier: bool = True
 
     @field_validator("slug")
     @classmethod
@@ -173,6 +185,16 @@ class BodySettings(BaseModel):
     def validate_identifier(self, identifier: str | None) -> bool:
         """Cheap guard against a silently-broken selector.
 
+        Matched CASE-INSENSITIVELY. The site's own data entry is inconsistent --
+        a live run rejected `Adj-00047219` against a pattern expecting `ADJ`,
+        which failed identically on all three Dagster attempts because a
+        capitalisation difference is not something a retry can fix.
+
+        Case-insensitivity does not weaken the guard. This exists to catch a
+        selector that has started returning page chrome instead of a reference,
+        and "Click here for a Guide" fails the pattern in any case. Rejecting a
+        real decision over the site's own typo is the worse error.
+
         ``re.match`` caches compiled patterns internally, so recompiling per call
         is free in practice. Kept as a method rather than a cached_property to
         avoid Pydantic model-attribute edge cases.
@@ -181,7 +203,7 @@ class BodySettings(BaseModel):
             return False
         if self.identifier_pattern is None:
             return True
-        return bool(re.match(self.identifier_pattern, identifier.strip()))
+        return bool(re.match(self.identifier_pattern, identifier.strip(), re.IGNORECASE))
 
 
 class ListingSelectors(BaseModel):
@@ -220,6 +242,9 @@ class ScrapingSettings(BaseModel):
     decisions_flag: int = 1
     date_display_format: str = "%d/%m/%Y"
     # Confirmed by recon: &pageNumber=2, 1-based, omitted for page 1.
+    # Selector for a real document download link on a wrapper page. See the
+    # config comment: scoped to the content column so chrome PDFs cannot match.
+    document_pdf_link: str = "div.col-sm-9 a[href$='.pdf']"
     page_param: str = "pageNumber"
     result_count_pattern: str = r"Shows\s+(\d+)\s+to\s+(\d+)\s+of\s+([\d,]+)\s+results"
     # Positive marker for an empty result set, which the site renders INSTEAD of
@@ -251,8 +276,45 @@ class ScrapingSettings(BaseModel):
     # computing the comparison hash only -- the stored file keeps the page
     # exactly as fetched.
     volatile_content_patterns: list[str] = Field(default_factory=list)
+    # Decorations the listing appends to a reference, removed before the
+    # identifier is compared or validated. Presentation, not identity.
+    identifier_strip_patterns: list[str] = Field(default_factory=list)
     identifier_unsafe_chars: str = '/\\:*?"<>| '
     identifier_replacement: str = "-"
+
+    def clean_identifier(self, identifier: str) -> str:
+        """Remove listing decorations from a scraped reference.
+
+        The Equality Tribunal's listing renders its title attribute as
+        ``DEC-E2010-001 - Full Case Report`` while ``span.refNO`` gives the bare
+        reference. WRC and Labour Court add nothing. Left alone, all 14 records
+        in a sampled month failed the identifier cross-check -- correctly, since
+        a reference with a suffix glued on is not the reference.
+
+        Internal whitespace runs are also collapsed to a single space. That is
+        not cosmetic -- it prevents phantom records and, worse, silent data loss:
+
+            "RP2325/2010,   WT890/2011, MN1681/2010, ..."   three spaces
+            "RP2325/2010,  WT890/2011, MN1681/2010, ..."    two spaces
+
+        Both appeared in one live 2012 month. They differ only in spacing, so the
+        unique index on (body, identifier) saw two records -- but
+        ``safe_identifier`` collapses runs of its replacement character, so both
+        produced the SAME curated key ``RP2325-2010-WT890-2011-...pdf``, and one
+        document silently overwrote the other. One of the two pairs had different
+        content hashes, so a real document was lost.
+
+        Collapsing here makes them one identifier, which the unique index then
+        correctly treats as one record.
+
+        Applied before the cross-check and the pattern check, so the cross-check
+        keeps comparing references rather than presentation. Note the site is
+        inconsistent even about its decorations: one record read
+        ``DEC-E2010-003- Full Case Report`` with no space before the dash.
+        """
+        for pattern in self.identifier_strip_patterns:
+            identifier = re.sub(pattern, "", identifier, flags=re.IGNORECASE)
+        return re.sub(r"\s+", " ", identifier).strip()
 
     def strip_volatile(self, data: bytes) -> bytes:
         """Remove per-request noise so equal documents hash equally.
@@ -326,7 +388,7 @@ class ScrapingSettings(BaseModel):
 
     def search_url(
         self,
-        body: "BodySettings",
+        body: BodySettings,
         start: date,
         end: date,
         page: int | None = None,
@@ -372,7 +434,7 @@ class ScrapingSettings(BaseModel):
         return cleaned.strip(self.identifier_replacement)
 
     @model_validator(mode="after")
-    def _unique_slugs(self) -> "ScrapingSettings":
+    def _unique_slugs(self) -> ScrapingSettings:
         slugs = [body.slug for body in self.bodies]
         duplicates = {slug for slug in slugs if slugs.count(slug) > 1}
         if duplicates:

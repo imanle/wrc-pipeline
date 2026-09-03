@@ -35,7 +35,7 @@ is the single conversion point between the two.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from enum import Enum
 from typing import Any
 
@@ -63,7 +63,7 @@ class RecordStatus(str, Enum):
 
 def _utcnow() -> datetime:
     """Timezone-aware UTC timestamp, matching ``mongo.py``."""
-    return datetime.now(tz=timezone.utc)
+    return datetime.now(tz=UTC)
 
 
 class DocumentRecord(BaseModel):
@@ -99,6 +99,10 @@ class DocumentRecord(BaseModel):
     # it and because a second source will populate it differently.
     title: str | None = None
     description: str | None = None
+    # The site's own case number, from `span.refNO`. For most bodies this repeats
+    # the identifier; for the Employment Appeals Tribunal it is a distinct
+    # numeric value shared across a group of claims, and worth keeping.
+    case_number: str | None = None
     published_date: date
 
     # --- URLs -------------------------------------------------------------- #
@@ -108,6 +112,11 @@ class DocumentRecord(BaseModel):
     # The document itself, taken from the site's own href. NEVER rebuilt from the
     # identifier: three incompatible manglings were observed during recon.
     document_url: str
+    # Set only when `document_url` turned out to be a WRAPPER page and the real
+    # document was one link deeper -- every Employment Appeals Tribunal decision
+    # is a PDF behind such a page. Kept separate from `document_url` so the
+    # listing's own link is still recorded and the derivation stays traceable.
+    document_file_url: str | None = None
 
     # --- partitioning (requirement 3) -------------------------------------- #
     partition_date: date
@@ -276,6 +285,7 @@ def record_from_listing(
     partition_date: date,
     partition_key: str,
     description: str | None = None,
+    case_number: str | None = None,
     file_ext: str | None = None,
     settings: Settings | None = None,
 ) -> DocumentRecord:
@@ -291,6 +301,7 @@ def record_from_listing(
         body=settings.scraping.body_by_slug(body_slug).name,
         body_slug=body_slug,
         description=description,
+        case_number=case_number,
         published_date=published_date,
         source_url=source_url,
         document_url=document_url,

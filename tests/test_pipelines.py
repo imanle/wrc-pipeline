@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 from scrapy.exceptions import DropItem
-from scrapy.http import Request, Response
+from scrapy.http import HtmlResponse, Request, Response
 from twisted.internet import defer
 
 from wrc_pipeline.logging_config import PartitionCounters
@@ -27,8 +27,8 @@ from wrc_pipeline.scraper import pipelines
 from wrc_pipeline.scraper.items import DocumentRecord, RecordStatus
 from wrc_pipeline.scraper.pipelines import DocumentDownloadPipeline
 from wrc_pipeline.settings import load_settings
-from wrc_pipeline.storage.mongo import WriteOutcome
 from wrc_pipeline.storage import objectstore as real_store
+from wrc_pipeline.storage.mongo import WriteOutcome
 from wrc_pipeline.storage.objectstore import StoredObject, UploadOutcome
 
 DOC_URL = "https://www.workplacerelations.ie/en/cases/2024/january/adj-00054658.html"
@@ -38,19 +38,59 @@ DOC_URL = "https://www.workplacerelations.ie/en/cases/2024/january/adj-00054658.
 # Fakes
 # --------------------------------------------------------------------------- #
 class FakeEngine:
-    """Captures the request and returns a canned response."""
+    """Captures the request and returns a canned response.
+
+    Offers BOTH engine APIs, because the pipeline prefers the newer one:
+    ``download_async`` (a coroutine, Scrapy 2.14+) and ``download`` (returning a
+    Deferred, deprecated). A fake with only the old method would have let the
+    pipeline keep using the deprecated call while the tests stayed green -- which
+    is exactly what happened, until a live run logged the warning on every
+    document.
+
+    ``LegacyFakeEngine`` below models an older Scrapy, for the fallback path.
+    """
 
     def __init__(self, response: Response | Exception) -> None:
         self.response = response
         self.requests: list[Request] = []
+        self.used: list[str] = []
+
+    async def download_async(self, request: Request) -> Any:
+        self.requests.append(request)
+        self.used.append("download_async")
+        if isinstance(self.response, Exception):
+            raise self.response
+        return self.response
 
     def download(self, request: Request) -> Any:
-        """Returns a Twisted Deferred, as the real engine does.
+        """Returns a Twisted Deferred, as the real deprecated method does.
 
         Not an asyncio.Future: maybe_deferred_to_future() takes a Deferred, and a
         fake that returns the wrong type tests nothing but itself.
         """
         self.requests.append(request)
+        self.used.append("download")
+        if isinstance(self.response, Exception):
+            return defer.fail(self.response)
+        return defer.succeed(self.response)
+
+
+class LegacyFakeEngine:
+    """An engine with only the deprecated method, as on scrapy < 2.14.
+
+    A separate class rather than a flag on FakeEngine: the pipeline checks with
+    getattr, and deleting an instance attribute would not hide a method defined
+    on the class.
+    """
+
+    def __init__(self, response: Response | Exception) -> None:
+        self.response = response
+        self.requests: list[Request] = []
+        self.used: list[str] = []
+
+    def download(self, request: Request) -> Any:
+        self.requests.append(request)
+        self.used.append("download")
         if isinstance(self.response, Exception):
             return defer.fail(self.response)
         return defer.succeed(self.response)
@@ -252,6 +292,33 @@ def test_etag_and_last_modified_are_stored(cfg, monkeypatch, item):
     assert record.last_modified == "Wed, 17 Jan 2024 09:00:00 GMT"
 
 
+def test_the_modern_engine_api_is_preferred(cfg, monkeypatch, item):
+    """Scrapy 2.14 deprecated engine.download(); using it warns once per
+    document, which buries the run's own logs."""
+    spider = FakeSpider()
+    pipeline, _, _ = _pipeline(cfg, monkeypatch, _response())
+
+    _run(pipeline, item, spider)
+    assert pipeline.crawler.engine.used == ["download_async"]
+
+
+def test_the_legacy_engine_api_still_works(cfg, monkeypatch, item):
+    """pyproject allows scrapy>=2.12, where download_async does not exist. A hard
+    switch would break the lower bound we declare."""
+    spider = FakeSpider()
+    mongo_spy, store_spy = MongoSpy(), StoreSpy()
+    monkeypatch.setattr(pipelines, "mongo", mongo_spy)
+    monkeypatch.setattr(pipelines, "store", store_spy)
+
+    engine = LegacyFakeEngine(_response())
+    pipeline = DocumentDownloadPipeline(FakeCrawler(engine), config=cfg)
+    pipeline.run_id = "test-run"
+
+    record = _run(pipeline, item, spider)
+    assert engine.used == ["download"]
+    assert record.status is RecordStatus.SCRAPED
+
+
 def test_request_uses_dont_filter(cfg, monkeypatch, item):
     """Required, not tidiness: one file serves three case references on this
     site (rp2147_2009_mn1794_2009_wt796_2009.html), so records legitimately
@@ -374,6 +441,149 @@ def test_counting_follows_mongo_not_the_object_store(cfg, monkeypatch, item):
     _run(pipeline, item, spider)
     assert spider.counters[("wrc", "2024-01")].scraped == 1
     assert spider.counters[("wrc", "2024-01")].skipped == 0
+
+
+# --------------------------------------------------------------------------- #
+# Wrapper pages -- the document is one link deeper
+# --------------------------------------------------------------------------- #
+WRAPPER_PAGE = b"""<html><body>
+  <header><a href="/en/privacy-policy/cookie_policy.pdf">Cookie Policy</a></header>
+  <a href="/en/Publications_Forms/Decisions_Information_Guide.pdf">click here</a>
+  <div class="col-sm-9">
+    <h1 class="page-title">MN1006/2010</h1>
+    <div class="content"></div>
+    <a href="/en/eat_import/2012/01/7eee3759.pdf">Download</a>
+  </div>
+</body></html>"""
+
+REAL_PDF = b"%PDF-1.4 the actual determination" + b"\x00" * 4000
+
+
+class TwoStepEngine:
+    """Serves the wrapper first, then the PDF -- as the real site does."""
+
+    def __init__(self, first: Response, second: Response) -> None:
+        self.responses = [first, second]
+        self.requests: list[Request] = []
+
+    async def download_async(self, request: Request) -> Any:
+        self.requests.append(request)
+        return self.responses.pop(0)
+
+
+def _html_response(body: bytes, url: str = DOC_URL) -> HtmlResponse:
+    return HtmlResponse(
+        url=url, status=200, body=body, encoding="utf-8", request=Request(url=url)
+    )
+
+
+def _two_step(cfg, monkeypatch, first, second):
+    mongo_spy, store_spy = MongoSpy(), StoreSpy()
+    monkeypatch.setattr(pipelines, "mongo", mongo_spy)
+    monkeypatch.setattr(pipelines, "store", store_spy)
+    pipeline = DocumentDownloadPipeline(FakeCrawler(TwoStepEngine(first, second)), config=cfg)
+    pipeline.run_id = "test-run"
+    return pipeline, mongo_spy, store_spy
+
+
+def test_a_wrapper_page_is_followed_to_the_real_pdf(cfg, monkeypatch, item):
+    """Every Employment Appeals Tribunal decision is a PDF behind a page whose
+    only content is a download link. Storing the wrapper stored 796 characters of
+    cookie banner; all 216 records in a live month came out flagged thin."""
+    spider = FakeSpider()
+    pdf = Response(
+        url="https://www.workplacerelations.ie/en/eat_import/2012/01/7eee3759.pdf",
+        status=200,
+        body=REAL_PDF,
+        headers={"Content-Type": "application/pdf"},
+        request=Request(url="https://x"),
+    )
+    pipeline, mongo_spy, store_spy = _two_step(
+        cfg, monkeypatch, _html_response(WRAPPER_PAGE), pdf
+    )
+
+    record = _run(pipeline, item, spider)
+
+    # The PDF is what got stored, not the wrapper.
+    assert store_spy.uploads[0]["data"] == REAL_PDF
+    assert store_spy.uploads[0]["ext"] == ".pdf"
+    assert record.file_ext == ".pdf"
+    # The listing's own link is still recorded, alongside the resolved one.
+    assert record.document_url == DOC_URL
+    assert record.document_file_url.endswith("/eat_import/2012/01/7eee3759.pdf")
+
+
+def test_the_chrome_pdfs_are_never_followed(cfg, monkeypatch, item):
+    """Three .pdf links exist on the page. Two are the cookie policy and an
+    information guide, in the header and footer. An unscoped selector would have
+    stored the cookie policy once per record."""
+    spider = FakeSpider()
+    pdf = Response(
+        url="https://www.workplacerelations.ie/en/eat_import/2012/01/7eee3759.pdf",
+        status=200,
+        body=REAL_PDF,
+        headers={"Content-Type": "application/pdf"},
+        request=Request(url="https://x"),
+    )
+    pipeline, _, _ = _two_step(cfg, monkeypatch, _html_response(WRAPPER_PAGE), pdf)
+
+    _run(pipeline, item, spider)
+    followed = pipeline.crawler.engine.requests[1].url
+    assert "eat_import" in followed
+    assert "cookie_policy" not in followed
+    assert "Decisions_Information_Guide" not in followed
+
+
+def test_a_real_decision_page_is_not_followed(cfg, monkeypatch, item):
+    """A page with its own content is the decision. Following an attachment link
+    there would replace the decision with its appendix."""
+    spider = FakeSpider()
+    page = (
+        b"<html><body><div class='col-sm-9'><div class='content'><p>"
+        + b"Findings and conclusions. " * 40
+        + b"</p></div><a href='/en/appendix.pdf'>Appendix</a></div></body></html>"
+    )
+    pipeline, _, store_spy = _pipeline(cfg, monkeypatch, _html_response(page))
+
+    _run(pipeline, item, spider)
+    assert len(pipeline.crawler.engine.requests) == 1  # nothing followed
+    assert store_spy.uploads[0]["ext"] == ".html"
+
+
+def test_an_ambiguous_wrapper_is_not_followed(cfg, monkeypatch, item):
+    """Two candidate links means the assumption is wrong. Guessing which to
+    follow is worse than storing what we were given."""
+    spider = FakeSpider()
+    page = (
+        b"<html><body><div class='col-sm-9'><div class='content'></div>"
+        b"<a href='/en/eat_import/a.pdf'>Part 1</a>"
+        b"<a href='/en/eat_import/b.pdf'>Part 2</a></div></body></html>"
+    )
+    pipeline, _, store_spy = _pipeline(cfg, monkeypatch, _html_response(page))
+
+    _run(pipeline, item, spider)
+    assert len(pipeline.crawler.engine.requests) == 1
+    assert store_spy.uploads[0]["ext"] == ".html"
+
+
+def test_a_missing_wrapper_target_is_a_failure(cfg, monkeypatch, item):
+    """The wrapper promised a document and the link 404s. Storing the wrapper
+    instead would look like success."""
+    spider = FakeSpider()
+    missing = Response(
+        url="https://x/eat_import/gone.pdf", status=404, body=b"", request=Request(url="https://x")
+    )
+    pipeline, mongo_spy, store_spy = _two_step(
+        cfg, monkeypatch, _html_response(WRAPPER_PAGE), missing
+    )
+
+    with pytest.raises(DropItem):
+        _run(pipeline, item, spider)
+
+    assert store_spy.uploads == []
+    assert "wrapper_target_unavailable" in spider.counters[("wrc", "2024-01")].failures[0][
+        "reason"
+    ]
 
 
 # --------------------------------------------------------------------------- #

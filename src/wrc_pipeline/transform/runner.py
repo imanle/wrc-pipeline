@@ -123,11 +123,13 @@ def _curated_record(
             "body_slug",
             "title",
             "description",
+            "case_number",
             "published_date",
             "partition_date",
             "partition_key",
             "source_url",
             "document_url",
+            "document_file_url",
             "file_ext",
             "content_type",
         )

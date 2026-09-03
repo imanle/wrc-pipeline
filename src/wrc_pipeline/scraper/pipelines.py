@@ -47,6 +47,7 @@ from typing import Any
 
 import scrapy
 from scrapy.exceptions import DropItem
+from scrapy.http import TextResponse
 from scrapy.utils.defer import maybe_deferred_to_future
 
 from ..logging_config import PartitionCounters, get_logger
@@ -55,6 +56,7 @@ from ..storage import mongo
 from ..storage import objectstore as store
 from ..storage.mongo import WriteOutcome
 from ..storage.objectstore import ObjectStoreError
+from ..transform.cleaner import is_html_extension
 from .items import DocumentRecord, RecordStatus
 from .spiders.wrc_decisions import partition_size_value
 
@@ -206,9 +208,7 @@ class DocumentDownloadPipeline:
         existing = mongo.find_existing(item.body_slug, item.identifier, self.cfg)
 
         try:
-            response = await maybe_deferred_to_future(
-                self.crawler.engine.download(self._document_request(item, existing))
-            )
+            response = await self._download(self._document_request(item, existing))
         except Exception as exc:  # noqa: BLE001 -- every cause is a logged failure
             # Retries are already exhausted by the time we get here: timeouts,
             # DNS failures, connection resets, malformed responses.
@@ -233,6 +233,44 @@ class DocumentDownloadPipeline:
         if not response.body:
             self._record_failure(item, counters, "empty_response_body", 200, spider)
             raise DropItem(f"empty body for {item.identifier}")
+
+        # --- follow a wrapper page to the real document -------------------- #
+        # Some pages are not the decision, only a link to it. Resolved here, at
+        # download time, rather than during transformation: the landing zone must
+        # hold the actual document, and requirement 6a wants PDFs stored as they
+        # are.
+        document_file_url: str | None = None
+        wrapper_target = self._wrapper_pdf_url(item, response)
+        if wrapper_target:
+            try:
+                pdf_response = await self._download(
+                    self._document_request(item, None, url=wrapper_target)
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._record_failure(
+                    item, counters, f"wrapper_download_failed:{type(exc).__name__}", None, spider
+                )
+                raise DropItem(f"wrapper download failed for {item.identifier}") from exc
+
+            if pdf_response.status != 200 or not pdf_response.body:
+                self._record_failure(
+                    item, counters, "wrapper_target_unavailable", pdf_response.status, spider
+                )
+                raise DropItem(f"wrapper target unavailable for {item.identifier}")
+
+            log.info(
+                "document.wrapper_followed",
+                extra={
+                    "identifier": item.identifier,
+                    "wrapper_url": item.document_url,
+                    "document_file_url": wrapper_target,
+                    "wrapper_bytes": len(response.body),
+                    "document_bytes": len(pdf_response.body),
+                },
+            )
+            document_file_url = wrapper_target
+            response = pdf_response
+            item = item.model_copy(update={"file_ext": _extension_of_url(wrapper_target)})
 
         # --- store the bytes ---------------------------------------------- #
         extension = self._resolve_extension(item, response)
@@ -266,6 +304,7 @@ class DocumentDownloadPipeline:
         record = item.attach_stored_object(stored).model_copy(
             update={
                 "file_ext": extension,
+                "document_file_url": document_file_url,
                 "etag": _header(response, "ETag"),
                 "last_modified": _header(response, "Last-Modified"),
                 "run_id": self.run_id or item.run_id,
@@ -305,10 +344,77 @@ class DocumentDownloadPipeline:
     # ------------------------------------------------------------------ #
     # Helpers
     # ------------------------------------------------------------------ #
+    async def _download(self, request: scrapy.Request) -> Any:
+        """Fetch one document through Scrapy's engine.
+
+        Scrapy 2.14 replaced ``engine.download()`` with the coroutine
+        ``download_async()``; the old name still works but warns on every single
+        document, which buries the run's own logs. ``pyproject.toml`` allows
+        scrapy>=2.12, so the new API is preferred when present rather than
+        required -- a hard switch would break the lower bound we declare.
+        """
+        engine = self.crawler.engine
+        download_async = getattr(engine, "download_async", None)
+        if download_async is not None:
+            return await download_async(request)
+        return await maybe_deferred_to_future(engine.download(request))
+
+    def _wrapper_pdf_url(self, item: DocumentRecord, response: Any) -> str | None:
+        """The real document's URL, when this page is only a link to it.
+
+        Every Employment Appeals Tribunal decision is a PDF behind a wrapper
+        page: the listing links to HTML whose entire content is a download link,
+        and the 796 characters of text on it are cookie banner and site chrome.
+
+        Two conditions, and both matter:
+
+        * the page must have NO content of its own, judged with the same
+          selectors the transformation stage uses. A page that has both content
+          and an attachment is a decision with an appendix, and following the
+          link would replace the decision with the appendix.
+        * there must be EXACTLY ONE candidate link. Zero means this is not a
+          wrapper; more than one means the assumption is wrong, and guessing
+          which to follow is worse than storing what we were given.
+        """
+        cfg = self.cfg
+        # Only a text response can be queried with a selector. A PDF or a
+        # response with no Content-Type arrives as a plain Response, where
+        # .css() raises NotSupported -- which would fail the whole item on a
+        # document that is already exactly what we wanted.
+        if not isinstance(response, TextResponse):
+            return None
+        if not is_html_extension(item.file_ext or ".html", cfg):
+            return None
+        if not cfg.scraping.document_pdf_link:
+            return None
+
+        for selector in cfg.transform.content_selectors:
+            if response.css(selector).css("::text").getall():
+                text = " ".join(response.css(selector).css("::text").getall()).strip()
+                if len(text) >= cfg.transform.min_content_chars:
+                    return None  # a real document; nothing to follow
+
+        links = response.css(cfg.scraping.document_pdf_link).css("::attr(href)").getall()
+        unique = list(dict.fromkeys(links))
+        if len(unique) != 1:
+            if unique:
+                log.warning(
+                    "document.wrapper_ambiguous",
+                    extra={
+                        "identifier": item.identifier,
+                        "candidates": unique,
+                        "reason": "expected exactly one download link",
+                    },
+                )
+            return None
+
+        return response.urljoin(unique[0])
+
     def _document_request(
         self,
         item: DocumentRecord,
         existing: dict[str, Any] | None,
+        url: str | None = None,
     ) -> scrapy.Request:
         """Build the document request, conditional when we have a validator.
 
@@ -333,7 +439,7 @@ class DocumentDownloadPipeline:
                 headers["If-Modified-Since"] = existing["last_modified"]
 
         return scrapy.Request(
-            item.document_url,
+            url or item.document_url,
             headers=headers,
             dont_filter=True,
             meta={"handle_httpstatus_all": True},
@@ -464,6 +570,16 @@ class DocumentDownloadPipeline:
         # and the landing collection stays a record of documents we actually
         # hold. The counter and the ledger are what make the record accounted
         # for.
+
+
+def _extension_of_url(url: str) -> str:
+    """Extension from a URL path, defaulting to ``.pdf``.
+
+    Only used for a followed wrapper link, where the config selector already
+    matched on ``href$='.pdf'``.
+    """
+    tail = url.split("?", 1)[0].rsplit("/", 1)[-1]
+    return f".{tail.rsplit('.', 1)[-1].lower()}" if "." in tail else ".pdf"
 
 
 def _header(response: Any, name: str) -> str | None:

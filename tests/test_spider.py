@@ -357,6 +357,52 @@ def test_identifier_mismatch_is_a_failure(cfg, partition):
     assert "identifier_mismatch" in spider.counters[("wrc", "2024-01")].failures[0]["reason"]
 
 
+def test_a_decorated_title_is_cleaned_before_the_crosscheck(cfg, partition):
+    """The Equality Tribunal's listing appends " - Full Case Report" to the title
+    attribute but not to span.refNO. A live run of one 2010 month failed all 14
+    records on the cross-check before this."""
+    spider = _spider(cfg)
+    items = _item_html(
+        identifier="DEC-E2010-001 - Full Case Report", crosscheck="DEC-E2010-001"
+    )
+    records = [
+        item
+        for item in spider.parse_page(_page(items=items), "equality-tribunal", partition, 2)
+        if isinstance(item, DocumentRecord)
+    ]
+
+    assert len(records) == 1
+    assert records[0].identifier == "DEC-E2010-001"
+    assert spider.counters[("equality-tribunal", "2024-01")].failed == 0
+
+
+def test_the_crosscheck_is_skipped_where_the_fields_differ_by_design(cfg, partition):
+    """For the Employment Appeals Tribunal the title holds statutory references
+    and span.refNO holds a numeric case number. Comparing them failed all 216
+    records in a live 2012 month."""
+    spider = _spider(cfg)
+    items = _item_html(identifier="RP1677/2009", crosscheck="37340")
+    records = [
+        item
+        for item in spider.parse_page(
+            _page(items=items), "employment-appeals-tribunal", partition, 2
+        )
+        if isinstance(item, DocumentRecord)
+    ]
+
+    assert len(records) == 1
+    assert records[0].identifier == "RP1677/2009"
+    # The case number is kept rather than discarded -- it is real metadata.
+    assert records[0].case_number == "37340"
+    assert spider.counters[("employment-appeals-tribunal", "2024-01")].failed == 0
+
+
+def test_the_case_number_is_captured_for_bodies_that_do_crosscheck(cfg, partition):
+    spider = _spider(cfg)
+    (record,) = _records(spider, _page(), partition)
+    assert record.case_number == "IR - SC - 00000787"
+
+
 def test_whitespace_only_difference_is_not_a_mismatch(cfg, partition):
     """`IR - SC - 00000787` and `IR-SC-00000787` are the same reference rendered
     two ways in the same markup."""

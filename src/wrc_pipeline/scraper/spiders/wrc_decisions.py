@@ -373,20 +373,38 @@ class WrcDecisionsSpider(scrapy.Spider):
             # is a different question from whether we could read it.
             counters.record_entry()
             identifier = self._first(block, selectors.identifier)
+            if identifier:
+                # Strip listing decorations before anything compares or
+                # validates this. The Equality Tribunal appends
+                # " - Full Case Report" to the title attribute but not to
+                # span.refNO, which failed the cross-check on every record.
+                identifier = self.cfg.scraping.clean_identifier(identifier)
 
             if not identifier:
                 counters.record_unidentified()
                 counters.record_failure(response.url, "identifier_missing", "selector")
                 continue
 
-            # The identifier appears three times in the markup. Cross-checking is
-            # a free integrity test: disagreement means our parse has drifted
-            # from the DOM, and writing a record with a wrong reference is worse
-            # than writing none -- a wrong reference is silently wrong forever,
-            # a missing one is in the ledger.
-            if selectors.identifier_crosscheck:
-                crosscheck = self._first(block, selectors.identifier_crosscheck)
-                if crosscheck and _normalise_ref(crosscheck) != _normalise_ref(identifier):
+            # `span.refNO` is captured for every body: it is the site's case
+            # number, which for most bodies repeats the identifier but for the
+            # Employment Appeals Tribunal is a distinct numeric value worth
+            # keeping.
+            case_number = (
+                self._first(block, selectors.identifier_crosscheck)
+                if selectors.identifier_crosscheck
+                else None
+            )
+
+            # Where the two ARE meant to agree, comparing them is a free
+            # integrity test: disagreement means our parse has drifted from the
+            # DOM, and a record with a wrong reference is silently wrong forever
+            # where a missing one is in the ledger.
+            #
+            # Skipped for bodies that declare the fields distinct -- see
+            # BodySettings.crosscheck_identifier.
+            if body.crosscheck_identifier and case_number:
+                crosscheck = case_number
+                if _normalise_ref(crosscheck) != _normalise_ref(identifier):
                     counters.record_failure(
                         response.url,
                         f"identifier_mismatch:{crosscheck}",
@@ -439,6 +457,7 @@ class WrcDecisionsSpider(scrapy.Spider):
                 partition_date=partition.partition_date,
                 partition_key=partition.key,
                 description=self._first(block, selectors.description),
+                case_number=case_number,
                 file_ext=_extension_of(document_url),
                 settings=self.cfg,
             )

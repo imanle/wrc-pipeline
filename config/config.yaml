@@ -128,6 +128,19 @@ scraping:
     html: [".html", ".htm", ".aspx"]
     binary: [".pdf", ".doc", ".docx", ".rtf"]
 
+  # Employment Appeals Tribunal decisions are PDFs behind a WRAPPER page: the
+  # listing links to an .html page whose only content is a download link, 796
+  # characters of which is cookie banner and site chrome. Confirmed against a
+  # live 2012 month -- all 216 records are like this, and all 216 came out of the
+  # transformation flagged `thin_content`, which is how it was found.
+  #
+  # Scoped to `div.col-sm-9` deliberately. Three .pdf links exist on the page;
+  # the other two are `cookie_policy.pdf` and `Decisions_Information_Guide.pdf`
+  # in the header and footer. Only the real document sits inside the content
+  # column, so an unscoped `a[href$='.pdf']` would happily store the cookie
+  # policy 216 times.
+  document_pdf_link: "${DOCUMENT_PDF_LINK:-div.col-sm-9 a[href$='.pdf']}"
+
   # Confirmed: &pageNumber=2 (1-based; omitted entirely for page 1).
   page_param: "${SEARCH_PAGE_PARAM:-pageNumber}"
   # Fixed by the site, 10 results per page. Used with the "of N results"
@@ -181,25 +194,47 @@ scraping:
       slug: "wrc"
       value: "15376"
       earliest_date: "2015-10-01"
-      identifier_pattern: "(?i)^(ADJ|IR)[- ]?.*"
+      identifier_pattern: "^(ADJ|IR)[- ]?.*"
 
     - name: "Labour Court"
       slug: "labour-court"
       value: "3"
       earliest_date: "1986-10-01"
-      identifier_pattern: "(?i)^[A-Z]{2,4}[-/ ]?[0-9/]+$"
+      identifier_pattern: "^[A-Z]{2,4}[-/ ]?[0-9/]+$"
 
     - name: "Equality Tribunal"
       slug: "equality-tribunal"
       value: "1"
       earliest_date: "1996-01-01"
-      identifier_pattern: "(?i)^(DEC-[A-Z][0-9]{4}-[0-9]+|[A-Z]{2}/[0-9]{4}/[0-9]+)$"
+      identifier_pattern: "^(DEC-[A-Z][0-9]{4}-[0-9]+|[A-Z]{2}/[0-9]{4}/[0-9]+)$"
 
     - name: "Employment Appeals Tribunal"
       slug: "employment-appeals-tribunal"
       value: "2"
       earliest_date: "2007-01-01"
-      identifier_pattern: "(?i)^([0-9]{3,6}|[A-Z]{2}[0-9]+/[0-9]{4})$"
+      # Statutory references, and often SEVERAL for one decision. Deliberately
+      # tolerant, because the site's own data entry is not: a live 2012 month
+      # (216 records) contained all of these forms --
+      #
+      #   RP1677/2009                             one reference
+      #   RP1105/2008, MN1197/2008, WT527/2008    several, comma-separated
+      #   UD365/2010 ,RP2819/2009                 space BEFORE the comma
+      #   UD1411/2010   RP1907/2010               no comma at all
+      #   RP1786/10                               two-digit year
+      #   ...WT551/201                            truncated year (typo)
+      #   UD462//2010                             double slash (typo)
+      #
+      # Hence `/{1,2}`, `[0-9]{2,4}` for the year and `[\s,]+` between
+      # references. Rejecting a real decision over the site's typo loses data,
+      # and the check's actual job -- catching a selector that has started
+      # returning navigation text -- is unaffected: "Ref no:", "View Page" and
+      # the numeric case number all still fail.
+      identifier_pattern: "(?i)^[A-Z]{2,3}[0-9]+/{1,2}[0-9]{2,4}([\\s,]+[A-Z]{2,3}[0-9]+/{1,2}[0-9]{2,4})*$"
+      # The title attribute and span.refNO are DIFFERENT identifiers here: the
+      # title holds the references above, refNO a numeric case number ("34007")
+      # shared across a group of claims -- one value appeared against 14 records
+      # in a sampled month. Comparing them failed all 216 records.
+      crosscheck_identifier: false
 
   # Per-request noise, stripped before computing the CONTENT hash used for change
   # detection and for the landing object key. The stored file is never modified.
@@ -216,7 +251,16 @@ scraping:
   # `identifier.ext`, and a raw slash would either create an accidental S3
   # prefix or fail outright on a local filesystem. We therefore keep the raw
   # `identifier` for fidelity and derive `identifier_safe` for object keys.
-  identifier_unsafe_chars: "/\\\\:*?\"<>| "
+  # The Equality Tribunal's listing appends " - Full Case Report" to the title
+  # attribute; the other bodies append nothing. Stripped before the identifier is
+  # cross-checked or validated, because it is presentation rather than identity.
+  # `\s*` on both sides of the dash: one sampled record had no leading space.
+  identifier_strip_patterns:
+    - "\\s*-\\s*Full Case Report\\s*$"
+
+  # Comma included for the Employment Appeals Tribunal's multi-reference
+  # identifiers, which would otherwise carry commas into object keys.
+  identifier_unsafe_chars: "/\\\\:*?\"<>| ,"
   identifier_replacement: "-"
 
 transform:
