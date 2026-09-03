@@ -1,18 +1,4 @@
 """Structured JSON logging.
-
-Requirement 10 asks for machine-readable logs carrying the current partition, the
-body, found-vs-scraped counts, failed downloads with URLs and error codes, and a
-per-run summary. That is a *shape* requirement, so the formatter is written by
-hand (~40 lines) rather than pulled from a library: every field that appears in
-the output is traceable to a line here.
-
-Usage
------
-    log = get_logger(__name__)
-    log.info("partition.start", extra={"body": "wrc", "partition_key": "2024-03"})
-
-Anything passed in ``extra`` is promoted to a top-level JSON key, so downstream
-tooling can filter with ``jq 'select(.body == "wrc")'``.
 """
 
 from __future__ import annotations
@@ -35,8 +21,6 @@ _RESERVED = {
     "thread", "threadName", "taskName",
 }
 
-# One id per OS process, stamped on every line so a run's logs can be isolated
-# even when several runs interleave in the same file.
 RUN_ID = os.environ.get("WRC_RUN_ID") or uuid.uuid4().hex[:12]
 
 
@@ -74,8 +58,7 @@ def configure_logging(
     root = logging.getLogger()
     root.setLevel(level.upper())
 
-    # Replace rather than append: Scrapy installs its own handlers, and without
-    # this we would emit every line twice, once plain and once as JSON.
+
     for handler in list(root.handlers):
         root.removeHandler(handler)
 
@@ -100,14 +83,6 @@ def configure_logging(
 
 class ContextLogger(logging.LoggerAdapter):
     """LoggerAdapter that *merges* bound context with per-call ``extra``.
-
-    The stdlib's own adapter overwrites ``kwargs["extra"]`` with ``self.extra``,
-    which silently discards every per-call field — the exact fields requirement
-    10 asks for. This override merges instead, with the per-call value winning.
-
-    ``bind()`` returns a new adapter carrying additional permanent context, so a
-    spider can attach ``body`` and ``partition_key`` once and have every
-    subsequent line inherit them.
     """
 
     def process(self, msg: Any, kwargs: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
@@ -125,11 +100,6 @@ def get_logger(name: str, **context: Any) -> ContextLogger:
 
 
 class PartitionCounters:
-    """Found-vs-scraped accounting for a single (body, partition) unit of work.
-
-    Kept as a plain object rather than module globals so Dagster can run several
-    partitions concurrently without the counts bleeding into each other.
-    """
 
     __slots__ = (
         "body",
@@ -147,48 +117,18 @@ class PartitionCounters:
     def __init__(self, body: str, partition_key: str) -> None:
         self.body = body
         self.partition_key = partition_key
-        # The site's stated total, which counts LISTING ENTRIES, not decisions.
         self.listings = 0
         self.scraped = 0
         self.skipped = 0  # already present and unchanged -> idempotent no-op
         self.failed = 0
         self.failures: list[dict[str, Any]] = []
-        # DISTINCT references accounted for, and the number the stated total must
-        # be compared against. Two live observations of the same date range
-        # (WRC, 2024-01-29..31, stated total 46) established why:
-        #
-        #   run A (sequential, 0.5s delay): 46 entries served, 6 of them repeats
-        #                                   of page 1 on page 2 -> 40 distinct
-        #   run B (normal crawl):           46 entries served, 46 distinct
-        #
-        # Run B proves 46 distinct decisions exist, so run A's 6 duplicates
-        # DISPLACED 6 real decisions that were never served at all. The site's
-        # page windows shift between requests, and when they overlap, records
-        # fall through the gap. The stated total counts decisions; overlap is
-        # loss, not a benign artefact of counting.
-        #
-        # Hence the operation counts alone cannot be trusted: in run A a
-        # duplicated store offsets a missed record exactly one-for-one, and
-        # `found == scraped + skipped + failed` reconciles perfectly while six
-        # documents are silently absent.
         self.seen: set[str] = set()
-        # Listing entries actually SERVED to us, duplicates included. Distinct
-        # from `listings` (advertised) and from `len(seen)` (decisions), and all
-        # three are needed: advertised-minus-served finds entries the site never
-        # produced, served-minus-distinct measures its page overlap.
         self.entries = 0
-        # Served entries with no readable reference. Excluded from the overlap
-        # arithmetic so they are not miscounted as duplicates; each one also
-        # raises a failure with its reason.
         self.unidentified = 0
 
     @property
     def found(self) -> int:
         """Alias for :attr:`listings`.
-
-        The spider and the CLI were written against ``found``, and the brief uses
-        that word. Kept as a property so the rename is documentation rather than
-        a refactor, while the attribute name says what the number actually is.
         """
         return self.listings
 
@@ -197,20 +137,12 @@ class PartitionCounters:
         self.listings = value
 
     def record_entry(self) -> None:
-        """Register one listing entry served, before it is validated."""
         self.entries += 1
 
     def record_unidentified(self) -> None:
-        """Register a served entry whose reference could not be read."""
         self.unidentified += 1
 
     def record_seen(self, identifier: str) -> None:
-        """Register one distinct record as accounted for.
-
-        Called for every record whatever its fate -- scraped, skipped or failed --
-        because the question this answers is "did we account for all 234?", not
-        "did we succeed on all 234?".
-        """
         self.seen.add(identifier)
 
     def record_failure(
@@ -237,46 +169,15 @@ class PartitionCounters:
         )
 
     def as_dict(self) -> dict[str, Any]:
-        """Summary for one partition, with reconciliation split into two checks.
-
-        ``listings_found`` is what the site advertised; ``records_distinct`` is
-        how many decisions that turned out to be. They are not the same number,
-        because the source's page windows overlap, so one check cannot cover
-        both questions:
-
-        * **listings_reconciled** -- did we see every decision the site
-          advertised? ``listings_found == records_distinct``. A shortfall means
-          decisions were advertised and never served to us, which on this source
-          happens when a page window overlaps its predecessor and displaces them.
-          ``duplicate_listings`` says how much overlap occurred, and is therefore
-          the explanation for the shortfall rather than an excuse for it.
-        * **records_reconciled** -- was every decision we did see accounted for?
-          ``records_distinct == scraped + skipped + failed``. A shortfall means we
-          found a decision and then lost it in our own pipeline.
-
-        Splitting them says WHERE to look: the first points at fetching, the
-        second at storage. ``reconciled`` is the conjunction, so callers that
-        just want a verdict still have one.
-        """
         distinct = len(self.seen)
         operations = self.scraped + self.skipped + self.failed
-
-        # Entries the site served more than once. NOT benign: a repeat occupies a
-        # slot that a real decision would have filled, so this is the mechanism
-        # by which records go missing on this source.
         duplicate_listings = max(self.entries - self.unidentified - distinct, 0)
-        # Advertised decisions we never saw, whatever the cause -- displaced by
-        # overlap, or simply never served.
         listings_unaccounted = max(self.listings - distinct, 0)
-        # Distinct decisions we parsed but never resolved to an outcome.
         records_unaccounted = max(distinct - operations, 0)
 
         return {
             "body": self.body,
             "partition_key": self.partition_key,
-            # Kept under the original name as well: it is the number the brief's
-            # "records found" refers to, and renaming it would silently change
-            # the meaning of every log already collected.
             "records_found": self.listings,
             "listings_found": self.listings,
             "records_scraped": self.scraped,

@@ -1,15 +1,4 @@
 """Configuration loading and validation.
-
-Design notes
-------------
-One mechanism, not two. ``config/config.yaml`` owns the *structure* and the
-defaults; ``${VAR:-default}`` placeholders inside it are expanded from the
-environment at load time. That means every single setting is overridable by an
-env var without the YAML enumerating which ones are "env-backed", and secrets
-never have to be committed.
-
-Everything is then validated through Pydantic models, so a bad partition size or
-a malformed date fails loudly at startup instead of three hours into a crawl.
 """
 
 from __future__ import annotations
@@ -51,13 +40,6 @@ class PartitionSize(str, Enum):
 # --------------------------------------------------------------------------- #
 def _expand_str(value: str) -> str:
     """Replace every ``${VAR}`` / ``${VAR:-default}`` occurrence in *value*.
-
-    Raises
-    ------
-    KeyError
-        If a placeholder has no default and the variable is unset. Failing here
-        is deliberate: a silently-empty connection string is far worse than a
-        crash on line one.
     """
 
     def _replace(match: re.Match[str]) -> str:
@@ -114,8 +96,7 @@ class S3Settings(BaseModel):
 
     @model_validator(mode="after")
     def _distinct_buckets(self) -> S3Settings:
-        # The brief is explicit that the landing zone is never mutated. Sharing a
-        # bucket between zones is the easiest way to violate that by accident.
+        # The brief is explicit that the landing zone is never mutated.
         if self.landing_bucket == self.curated_bucket:
             raise ValueError("landing_bucket and curated_bucket must differ")
         return self
@@ -137,11 +118,6 @@ class PartitionSettings(BaseModel):
 
 class BodySettings(BaseModel):
     """One entry from the site's left-hand 'Body' facet.
-
-    ``earliest_date`` comes from the WRC's own search guide and lets the spider
-    skip partitions that provably cannot hold records (e.g. WRC adjudication
-    decisions only exist from 2015-10-01). That both saves requests and removes
-    the ambiguity between "empty month" and "broken date filter".
     """
 
     name: str
@@ -149,17 +125,6 @@ class BodySettings(BaseModel):
     value: str
     earliest_date: date | None = None
     identifier_pattern: str | None = None
-    # Whether `span.refNO` holds the same reference as the title attribute.
-    #
-    # True for three bodies. FALSE for the Employment Appeals Tribunal, where the
-    # two fields are different identifiers: the title carries the statutory
-    # references ("RP1105/2008, MN1197/2008, WT527/2008") while refNO carries a
-    # numeric CASE number ("34007") shared across a group of claims -- one value
-    # appeared against 14 records in a sampled month. The site's own search
-    # offers "Decision Number" and "Case Number" as separate filters.
-    #
-    # Cross-checking them there compared two things that were never meant to
-    # agree, and failed all 216 records in a month.
     crosscheck_identifier: bool = True
 
     @field_validator("slug")
@@ -183,22 +148,6 @@ class BodySettings(BaseModel):
         return self.earliest_date is None or window_end >= self.earliest_date
 
     def validate_identifier(self, identifier: str | None) -> bool:
-        """Cheap guard against a silently-broken selector.
-
-        Matched CASE-INSENSITIVELY. The site's own data entry is inconsistent --
-        a live run rejected `Adj-00047219` against a pattern expecting `ADJ`,
-        which failed identically on all three Dagster attempts because a
-        capitalisation difference is not something a retry can fix.
-
-        Case-insensitivity does not weaken the guard. This exists to catch a
-        selector that has started returning page chrome instead of a reference,
-        and "Click here for a Guide" fails the pattern in any case. Rejecting a
-        real decision over the site's own typo is the worse error.
-
-        ``re.match`` caches compiled patterns internally, so recompiling per call
-        is free in practice. Kept as a method rather than a cached_property to
-        avoid Pydantic model-attribute edge cases.
-        """
         if not identifier:
             return False
         if self.identifier_pattern is None:
@@ -208,10 +157,6 @@ class BodySettings(BaseModel):
 
 class ListingSelectors(BaseModel):
     """CSS selectors for one record on the search results page.
-
-    Confirmed against live markup during recon. Held in config rather than
-    hardcoded in the spider so a site redesign is a YAML edit, and so the
-    selectors are visible to a reviewer without reading spider code.
     """
 
     record: str
@@ -241,16 +186,9 @@ class ScrapingSettings(BaseModel):
     search_path: str
     decisions_flag: int = 1
     date_display_format: str = "%d/%m/%Y"
-    # Confirmed by recon: &pageNumber=2, 1-based, omitted for page 1.
-    # Selector for a real document download link on a wrapper page. See the
-    # config comment: scoped to the content column so chrome PDFs cannot match.
     document_pdf_link: str = "div.col-sm-9 a[href$='.pdf']"
     page_param: str = "pageNumber"
     result_count_pattern: str = r"Shows\s+(\d+)\s+to\s+(\d+)\s+of\s+([\d,]+)\s+results"
-    # Positive marker for an empty result set, which the site renders INSTEAD of
-    # a count line. Distinguishing "the site says zero" from "we could not read
-    # the count" is what lets an empty partition succeed while a broken selector
-    # still fails hard.
     no_results_pattern: str = "There are no search results"
     max_pages_per_partition: int = Field(default=500, gt=0)
     page_size: int = Field(gt=0)
@@ -269,48 +207,13 @@ class ScrapingSettings(BaseModel):
     bodies: list[BodySettings] = Field(min_length=1)
     listing: ListingSelectors
     document_extensions: DocumentExtensions
-    # Byte patterns that change on every request without the document changing.
-    # WRC appends `<!-- Elapsed time: 0.046756 -->` (server render time) to every
-    # page, so a raw byte hash differs on every fetch and change detection would
-    # report all 234 January documents as amended on every run. Stripped before
-    # computing the comparison hash only -- the stored file keeps the page
-    # exactly as fetched.
     volatile_content_patterns: list[str] = Field(default_factory=list)
-    # Decorations the listing appends to a reference, removed before the
-    # identifier is compared or validated. Presentation, not identity.
     identifier_strip_patterns: list[str] = Field(default_factory=list)
     identifier_unsafe_chars: str = '/\\:*?"<>| '
     identifier_replacement: str = "-"
 
     def clean_identifier(self, identifier: str) -> str:
         """Remove listing decorations from a scraped reference.
-
-        The Equality Tribunal's listing renders its title attribute as
-        ``DEC-E2010-001 - Full Case Report`` while ``span.refNO`` gives the bare
-        reference. WRC and Labour Court add nothing. Left alone, all 14 records
-        in a sampled month failed the identifier cross-check -- correctly, since
-        a reference with a suffix glued on is not the reference.
-
-        Internal whitespace runs are also collapsed to a single space. That is
-        not cosmetic -- it prevents phantom records and, worse, silent data loss:
-
-            "RP2325/2010,   WT890/2011, MN1681/2010, ..."   three spaces
-            "RP2325/2010,  WT890/2011, MN1681/2010, ..."    two spaces
-
-        Both appeared in one live 2012 month. They differ only in spacing, so the
-        unique index on (body, identifier) saw two records -- but
-        ``safe_identifier`` collapses runs of its replacement character, so both
-        produced the SAME curated key ``RP2325-2010-WT890-2011-...pdf``, and one
-        document silently overwrote the other. One of the two pairs had different
-        content hashes, so a real document was lost.
-
-        Collapsing here makes them one identifier, which the unique index then
-        correctly treats as one record.
-
-        Applied before the cross-check and the pattern check, so the cross-check
-        keeps comparing references rather than presentation. Note the site is
-        inconsistent even about its decorations: one record read
-        ``DEC-E2010-003- Full Case Report`` with no space before the dash.
         """
         for pattern in self.identifier_strip_patterns:
             identifier = re.sub(pattern, "", identifier, flags=re.IGNORECASE)
@@ -318,10 +221,6 @@ class ScrapingSettings(BaseModel):
 
     def strip_volatile(self, data: bytes) -> bytes:
         """Remove per-request noise so equal documents hash equally.
-
-        Operates on bytes, not text: the result feeds a hash, and decoding a
-        document to strip a comment would mean guessing an encoding and could
-        itself change the bytes.
         """
         for pattern in self.volatile_content_patterns:
             data = re.sub(pattern.encode("utf-8"), b"", data)
@@ -329,28 +228,6 @@ class ScrapingSettings(BaseModel):
 
     def parse_result_count(self, text: str) -> int | None:
         """Extract the total from ``Shows 1 to 10 of 234 results``.
-
-        Three outcomes, and the distinction between the last two is the point:
-
-        * the count line parses -> that number is the baseline;
-        * no count line, but the site's explicit no-results message is present
-          -> ``0``, because zero IS a trustworthy baseline when the site says so;
-        * neither -> ``None``, which the caller must treat as a hard failure.
-
-        The third case is what this rule exists for: a page holding records whose
-        count we cannot read is unverifiable, and a silently-truncated partition
-        is the failure mode the whole pipeline is designed to make impossible.
-
-        Emptiness requires a POSITIVE signal rather than being inferred from the
-        absence of a count. Inferring it would collapse case three into case two
-        and turn a broken selector into a quiet "zero results" -- exactly the
-        failure the hard rule was written to prevent.
-
-        The empty case is real, not hypothetical: an Employment Appeals Tribunal
-        search for a 2024 week returns "There are no search results fitting your
-        keywords" with no count line, because that tribunal stopped issuing
-        decisions years ago. Before this, four such partitions failed and
-        exhausted their retries.
         """
         match = re.search(self.result_count_pattern, text)
         if match:
@@ -361,11 +238,6 @@ class ScrapingSettings(BaseModel):
 
     def page_count(self, total_results: int) -> int:
         """Number of listing pages holding *total_results* records.
-
-        The site fixes page size at 10 and exposes the total on page 1, so the
-        full page range is knowable after a single request. Pages 2..N are then
-        issued concurrently rather than discovered by following "next" links --
-        this is the main throughput lever in the crawl (requirement 1).
         """
         if total_results <= 0:
             return 0
@@ -374,11 +246,6 @@ class ScrapingSettings(BaseModel):
 
     def format_input_date(self, value: date) -> str:
         """Render a date the way the site's ``from``/``to`` params expect it.
-
-        The site uses unpadded day and month (``18/8/2026``). Built by hand
-        rather than with ``strftime("%-d/%-m/%Y")`` because the ``%-`` no-pad
-        modifier is a glibc/BSD extension that raises on Windows -- and this
-        format is a hard requirement of the endpoint, not a cosmetic choice.
         """
         return f"{value.day}/{value.month}/{value.year}"
 
@@ -395,10 +262,6 @@ class ScrapingSettings(BaseModel):
         keyword: str | None = None,
     ) -> str:
         """Build one search URL for a (body, partition[, page]) tuple.
-
-        Centralised here so the spider, the tests and any future source adapter
-        all agree on the contract, and so a change to the site's parameters is a
-        one-line edit rather than a hunt through the spider.
         """
         params: dict[str, str] = {
             "decisions": str(self.decisions_flag),
@@ -412,19 +275,11 @@ class ScrapingSettings(BaseModel):
             params[self.page_param] = str(page)
 
         base = f"{self.base_url.rstrip('/')}{self.search_path}"
-        # safe="/" keeps the d/M/yyyy slashes readable rather than %2F-encoded;
-        # the site accepts both, and readable URLs make the logs debuggable.
+
         return f"{base}?{urlencode(params, safe='/')}"
 
     def safe_identifier(self, identifier: str) -> str:
-        """Filesystem/object-key-safe form of a reference.
 
-        Labour Court and Equality Tribunal references embed forward slashes
-        (``CD/12/572``, ``EE/2006/040``). The brief requires curated files be
-        named ``identifier.ext``; left raw, those slashes would silently become
-        nested object prefixes and break the one-file-per-identifier guarantee.
-        The raw value is still persisted separately for fidelity.
-        """
         cleaned = identifier.strip()
         for char in self.identifier_unsafe_chars:
             cleaned = cleaned.replace(char, self.identifier_replacement)
@@ -450,10 +305,6 @@ class ScrapingSettings(BaseModel):
 
 class TransformSettings(BaseModel):
     """HTML cleaning rules for the curated zone (transformation stage).
-
-    Whitelist-first: ``content_selectors`` positively selects the decision body
-    and the rest of the document is discarded, so page chrome the site adds in
-    future is excluded without us having to enumerate it.
     """
 
     content_selectors: list[str] = Field(min_length=1)
@@ -499,12 +350,6 @@ class Settings(BaseModel):
 def load_settings(config_path: str | Path | None = None) -> Settings:
     """Read .env, load the YAML, expand placeholders, validate.
 
-    Parameters
-    ----------
-    config_path
-        Overrides the default ``config/config.yaml``. Also honours the
-        ``WRC_CONFIG_PATH`` env var, which is how the Dagster process and the
-        Scrapy process are pointed at the same file in CI.
     """
     load_dotenv(PROJECT_ROOT / ".env", override=False)
 
@@ -520,9 +365,4 @@ def load_settings(config_path: str | Path | None = None) -> Settings:
 
 @functools.lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    """Process-wide cached settings.
-
-    Cached because Scrapy pipelines, middlewares and the spider all need config
-    and re-reading the file per component would let them drift mid-run.
-    """
     return load_settings()

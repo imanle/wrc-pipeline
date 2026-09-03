@@ -3,44 +3,6 @@
 Two assets over the same partition space:
 
     landing_documents  ->  curated_documents
-
-Partitioning
-------------
-``MultiPartitionsDefinition`` of (body x week). That is not a presentation
-choice -- it is the pipeline's actual unit of work, and has been since the
-spider was written: ``PartitionCounters`` is keyed on ``(body, partition_key)``,
-object keys embed both, and a single one can be re-run in isolation. Expressing
-it natively means the Dagster UI shows a grid where one cell is one body-week,
-and a backfill or a retry can target exactly that cell.
-
-The alternative -- one partition per week, all four bodies inside it -- would
-make a single body's failure fail the week, and a retry would re-crawl the three
-bodies that were fine.
-
-Why ingestion runs in a subprocess
-----------------------------------
-Twisted's reactor cannot be restarted inside a process it has already run in.
-Dagster materialises several partitions in one process (a backfill, or two
-partitions in one run), so the second ``CrawlerProcess`` would fail with
-``ReactorNotRestartable``. Shelling out to ``python -m wrc_pipeline.cli`` gives
-each crawl a fresh interpreter.
-
-That is also why the CLI is not redundant with the orchestrator: it is the
-process boundary Dagster drives, and both entry points sit on the same core
-(``build_scrapy_settings`` + ``WrcDecisionsSpider``).
-
-The transformation has no reactor involved, so it runs in-process -- no
-subprocess, no serialisation, and exceptions surface directly.
-
-Retries and the source's pagination
------------------------------------
-Ingestion carries ``RetryPolicy(max_retries=2)`` and FAILS a partition whose
-store is incomplete. Both follow from a measured property of this source: its
-search pages serve overlapping windows non-deterministically, so a single pass
-can miss records that a second pass picks up (see ARCHITECTURE.md). Because the
-pipeline is idempotent, a retry re-fetches cheaply and only the missing
-documents cost anything -- so Dagster converges on a complete partition by
-itself, which is precisely what an orchestrator should be doing here.
 """
 
 # NOTE: no `from __future__ import annotations` here, deliberately. It turns
@@ -91,15 +53,7 @@ _settings = get_settings()
 
 
 BODY_PARTITIONS = StaticPartitionsDefinition([body.slug for body in _settings.scraping.bodies])
-# WEEKLY, pinned. Chosen empirically: a month of WRC results is 24 pages and the
-# site's page windows overlap non-deterministically at boundaries, which loses
-# records (see ARCHITECTURE.md); a week is roughly six pages. The orchestrator's
-# grid is also a deployment decision rather than a per-run one -- Dagster stores
-# materialisation state per partition KEY, and the keys differ by size
-# ("2024-01-29" weekly versus "2024-01-01" monthly), so changing granularity
-# orphans every recorded materialisation instead of converting it.
-#
-# Ad-hoc runs at other sizes go through the CLI, which takes --partition-size.
+# WEEKLY, pinned. 
 PARTITION_SIZE = PartitionSize.WEEKLY
 TIME_PARTITIONS = WeeklyPartitionsDefinition(
     start_date=_settings.partitions.start_date.isoformat(),
@@ -109,20 +63,12 @@ DOCUMENT_PARTITIONS = MultiPartitionsDefinition(
     {"body": BODY_PARTITIONS, TIME_DIMENSION: TIME_PARTITIONS}
 )
 
-# Two attempts after the first, with backoff. Tuned to the failure it exists for:
-# a pass that lost records to page-window overlap, which a re-fetch usually
-# fixes. Not a substitute for the failure ledger -- a 404 stays a 404.
+
 INGEST_RETRY = RetryPolicy(max_retries=2, delay=30, backoff=Backoff.LINEAR)
 
 
 def _dimensions(context: AssetExecutionContext) -> tuple[str, date, date, str]:
     """Unpack a multi-partition key into (body, start, end, internal_key).
-
-    The time dimension gives the window's first day; its end and the pipeline's
-    own key both come from ``partitions.window_for``. Deriving them there rather
-    than here is deliberate -- the spider computes the same key from the same
-    function, and two implementations of "which week is this" would eventually
-    disagree by a day.
     """
     keys = context.partition_key.keys_by_dimension
     start = datetime.strptime(keys[TIME_DIMENSION], "%Y-%m-%d").date()

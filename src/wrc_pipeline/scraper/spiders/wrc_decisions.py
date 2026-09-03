@@ -1,44 +1,4 @@
 """The decisions spider.
-
-Discovery only. This spider finds records and yields them as ``PENDING``
-:class:`~wrc_pipeline.scraper.items.DocumentRecord` objects; it never downloads a
-document. The item pipeline (Phase 4) owns downloading, hashing, uploading and
-the Mongo write.
-
-That split is deliberate:
-
-* Scrapy's scheduler controls download concurrency. Fetching documents inside a
-  parse callback would serialise them behind that callback instead.
-* The spider stays testable with a fabricated ``HtmlResponse`` and no network,
-  no MongoDB and no MinIO.
-* Discovery and storage fail for different reasons and want different retry
-  behaviour.
-
-Request structure
------------------
-Recon established that the search is a **stateless GET**: the server reflects all
-filter state into the query string, and a search URL works in a fresh incognito
-window with no cookie and no ``__VIEWSTATE``. So every ``(body, partition, page)``
-is an independent request. Consequences used here:
-
-* page 1 of a partition exposes ``Shows 1 to 10 of 234 results``, so the page
-  count is known after ONE request and pages 2..N are issued **in parallel**
-  rather than discovered by following "next" links. This is the main throughput
-  lever (requirement 1);
-* a failed request retries alone, without replaying a chain;
-* partitions are independently resumable, which is what lets Dagster retry a
-  single body-month.
-
-Counting
---------
-``records_found`` comes from the site's stated total, never from the number of
-``li.each-item`` blocks parsed. The stated total is the one number independent of
-our own selectors: if the record selector silently breaks, a parsed-count
-baseline would reconcile 0 against 0 and the failure would be invisible. Against
-the stated total it surfaces as ``found: 234, scraped: 0, reconciled: false``.
-
-Correspondingly, a total that cannot be parsed is a **hard failure** for that
-partition, not "zero results".
 """
 
 from __future__ import annotations
@@ -60,21 +20,12 @@ log = get_logger(__name__)
 
 def partition_size_value(size: Any) -> str:
     """Plain string for a partition size.
-
-    str() on a (str, Enum) member yields "PartitionSize.MONTHLY", which is a
-    Python repr leaking into logs and into the runs collection. Accepts a plain
-    string too, since the CLI passes one.
     """
     return getattr(size, "value", str(size))
 
 
 def _parse_cli_date(value: str | date | None, fallback: date) -> date:
     """Accept a date from the command line, config, or Dagster.
-
-    Scrapy passes ``-a`` arguments as strings, Dagster passes ``date`` objects and
-    config supplies a default, so all three shapes arrive here. ISO format only:
-    ``d/m/Y`` would be ambiguous, and the site's own unpadded format belongs in
-    URLs, not in a CLI contract.
     """
     if value is None:
         return fallback
@@ -152,7 +103,7 @@ class WrcDecisionsSpider(scrapy.Spider):
         """Standard Scrapy hook; kept explicit so the pipeline can reach the
         spider's counters via ``crawler.spider``."""
         spider = super().from_crawler(crawler, *args, **kwargs)
-        return spider  # type: ignore[return-value]
+        return spider
 
     def counters_for(self, body_slug: str, partition_key: str) -> PartitionCounters:
         """Fetch or create the counter for one unit of work."""
@@ -169,27 +120,11 @@ class WrcDecisionsSpider(scrapy.Spider):
     # ------------------------------------------------------------------ #
     async def start(self) -> Any:
         """Scrapy 2.13+ entry point for initial requests.
-
-        REQUIRED, not optional. Scrapy's default ``start()`` reads ``start_urls``
-        and does not call ``start_requests()``, so without this the crawl issues
-        zero requests and still exits cleanly -- no error, no deprecation
-        warning, just "Crawled 0 pages" and a run that reconciles trivially
-        because nothing was found. Found on the first live run.
-
-        ``start_requests()`` is kept as the synchronous implementation: it is
-        pure planning with no I/O, which keeps it directly testable.
         """
         for request in self.start_requests():
             yield request
 
     def start_requests(self) -> Iterator[scrapy.Request]:
-        """One page-1 request per ``(body, partition)``.
-
-        Partitions ending before a body's ``earliest_date`` are skipped. That
-        saves requests, but the real value is interpretive: with the floor in
-        place, ``records_found: 0`` always means "genuinely empty" and never "we
-        queried a period that cannot contain data".
-        """
         partitions = self.partitions()
         planned = 0
 
@@ -270,11 +205,6 @@ class WrcDecisionsSpider(scrapy.Spider):
         total = self.cfg.scraping.parse_result_count(response.text)
 
         if total is None:
-            # The hard failure. Without the stated total there is no baseline, so
-            # anything scraped from this partition is unverifiable -- and a
-            # silently truncated partition is the exact failure mode this
-            # pipeline exists to make impossible. Better to fail one partition
-            # loudly and re-run it than to record an unknown fraction of it.
             self.unreconcilable.append({"body": body_slug, "partition_key": partition.key})
             counters.record_failure(response.url, "result_count_unparseable", "no_baseline")
             log.error(
@@ -361,10 +291,6 @@ class WrcDecisionsSpider(scrapy.Spider):
     ) -> Iterator[DocumentRecord]:
         """Turn every ``li.each-item`` on a listing page into a PENDING record.
 
-        Four ways a record fails, each with a distinct reason string so the
-        ledger identifies *which* selector drifted rather than merely that
-        something did. A failure here is counted and skipped; it never aborts the
-        page, because one malformed record must not cost the other nine.
         """
         selectors = self.cfg.scraping.listing
 
@@ -385,10 +311,6 @@ class WrcDecisionsSpider(scrapy.Spider):
                 counters.record_failure(response.url, "identifier_missing", "selector")
                 continue
 
-            # `span.refNO` is captured for every body: it is the site's case
-            # number, which for most bodies repeats the identifier but for the
-            # Employment Appeals Tribunal is a distinct numeric value worth
-            # keeping.
             case_number = (
                 self._first(block, selectors.identifier_crosscheck)
                 if selectors.identifier_crosscheck
@@ -440,12 +362,6 @@ class WrcDecisionsSpider(scrapy.Spider):
                 )
                 continue
 
-            # ALWAYS the site's own href, never a URL rebuilt from the
-            # identifier: recon found three incompatible manglings, including
-            # literal spaces (`ir- sc- 00000787.html`) and three case references
-            # concatenated into one filename. urljoin preserves those spaces;
-            # Scrapy percent-encodes them when the Request is built, so the
-            # stored URL stays readable while the wire stays legal.
             document_url = response.urljoin(href)
 
             record = record_from_listing(
@@ -462,10 +378,6 @@ class WrcDecisionsSpider(scrapy.Spider):
                 settings=self.cfg,
             )
 
-            # Observed, not enforced. The site's date filter matches the decision
-            # date while the listing displays a date that does not always agree
-            # (documents filed under /2010/december/ carry references ending
-            # _2009). A hard check here would reject legitimate records.
             if not record.date_in_partition_window:
                 log.warning(
                     "record.date_outside_partition",
@@ -478,20 +390,12 @@ class WrcDecisionsSpider(scrapy.Spider):
                     },
                 )
 
-            # Keyed on identifier_safe, not the raw identifier: the site renders
-            # the same reference both ways (`IR-SC-00001259` and
-            # `IR - SC - 00001897`), so the raw form would count one decision as
-            # two distinct records.
             counters.record_seen(record.identifier_safe)
             yield record
 
     @staticmethod
     def _first(block: Any, selector: str) -> str | None:
         """First match for *selector*, stripped, or ``None``.
-
-        Config prefers ``@title`` attributes over text nodes -- they carry the
-        untruncated value and need no whitespace normalisation -- but text
-        selectors are still used for ``span.refNO``, hence the strip.
         """
         value = block.css(selector).get()
         return value.strip() if value and value.strip() else None
@@ -501,13 +405,6 @@ class WrcDecisionsSpider(scrapy.Spider):
     # ------------------------------------------------------------------ #
     def closed(self, reason: str) -> None:
         """Emit one summary per partition, plus the run summary (requirement 10).
-
-        Summaries are emitted here rather than when each partition finishes,
-        because Scrapy gives no natural "this partition is done" signal -- pages
-        from many partitions interleave. Tracking outstanding pages per partition
-        would give more precise timing at the cost of more state, and the
-        question largely dissolves under Dagster, where each partition is its own
-        run. Noted as a deliberate simplification.
         """
         totals = {
             "records_found": 0,
@@ -532,21 +429,13 @@ class WrcDecisionsSpider(scrapy.Spider):
                 unreconciled.append(f"{counters.body}/{counters.partition_key}")
 
         log.info(
-            # NOT "run.summary": mongo.finish_run owns that event name and emits a
-            # different shape. Two schemas under one event name breaks any log query.
             "crawl.summary",
             extra={
                 "reason": reason,
                 "partitions": len(self.counters),
                 **totals,
-                # The assertion that matters. False means records vanished
-                # without explanation -- the worst failure mode, because nothing
-                # else looks broken.
                 "reconciled": not unreconciled,
                 "unreconciled_partitions": unreconciled,
-                # Partitions with no trustworthy baseline at all. Distinct from
-                # the above: these could not be checked, rather than failing a
-                # check.
                 "partitions_without_baseline": self.unreconcilable,
             },
         )

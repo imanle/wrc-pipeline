@@ -1,21 +1,4 @@
 """Date-range partitioning.
-
-The spine of requirements 2 and 3: the crawl walks ``[start_date, end_date]`` in
-fixed-size windows, and every scraped record carries the window it came from.
-
-Deliberately free of I/O and of any Scrapy/Dagster imports so it can be unit
-tested in milliseconds and reused verbatim by both the spider and the
-orchestrator's partition definitions.
-
-Conventions
------------
-* Windows are **inclusive on both ends**, because the site's Start/Finish Date
-  filters are inclusive. Half-open windows here would silently drop one day's
-  decisions per partition.
-* Windows are clamped to the requested range, so a monthly walk starting on the
-  14th yields a short first window rather than reaching back to the 1st.
-* ``partition_key`` is a sortable, filename-safe label; ``partition_date`` is the
-  window's start and is what gets written to Mongo.
 """
 
 from __future__ import annotations
@@ -108,16 +91,7 @@ def generate_partitions(
     end_date: date,
     size: PartitionSize | str = PartitionSize.MONTHLY,
 ) -> Iterator[Partition]:
-    """Yield inclusive windows covering ``[start_date, end_date]``.
-
-    Examples
-    --------
-    >>> parts = list(generate_partitions(date(2024, 1, 1), date(2024, 3, 15), "monthly"))
-    >>> [p.key for p in parts]
-    ['2024-01', '2024-02', '2024-03']
-    >>> parts[-1].end
-    datetime.date(2024, 3, 15)
-    """
+    
     if isinstance(size, str):
         size = PartitionSize(size)
     if start_date > end_date:
@@ -141,19 +115,7 @@ def window_for(
     window_start: date,
     size: PartitionSize | str = PartitionSize.MONTHLY,
 ) -> Partition:
-    """The single window beginning at *window_start*, at the given size.
 
-    Public because the Dagster layer needs exactly this: it is handed a
-    partition-start date and must derive the window's end and the pipeline's own
-    key. Doing that arithmetic there would duplicate ``_end_of_window`` and
-    ``_key_for``, and the copies would drift -- an ISO-week key paired with a
-    seven-day window computed a different way is an off-by-one waiting to
-    happen.
-
-    Unlike :func:`generate_partitions`, the end is NOT clamped to a caller's
-    range: a weekly window starting 29 January genuinely ends 4 February, even
-    though a request for "January" would have stopped at the 31st.
-    """
     if isinstance(size, str):
         size = PartitionSize(size)
     return Partition(

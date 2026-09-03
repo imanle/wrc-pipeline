@@ -1,44 +1,4 @@
 """The document download pipeline.
-
-Where the three storage-facing modules finally meet. For each ``PENDING`` record
-the spider yields, this pipeline:
-
-1. looks up what we already hold (``mongo.find_existing``);
-2. downloads the document **through Scrapy's downloader**, with conditional
-   headers when we have a validator for it;
-3. uploads the bytes to MinIO under a content-addressed key;
-4. completes the record (``attach_stored_object``) and upserts it;
-5. increments the partition counters so found-vs-scraped reconciles.
-
-Why an item pipeline rather than the spider
--------------------------------------------
-Discovery and retrieval fail for different reasons and want different handling,
-and keeping them apart means the spider stays testable with no network and no
-containers. It also puts document fetching under Scrapy's downloader rather than
-in front of it.
-
-Why ``crawler.engine.download()`` and not ``requests``
-------------------------------------------------------
-Reaching for ``requests`` or ``httpx`` here would be simpler to read and would
-quietly bypass every throttle configured for this crawl: AutoThrottle, the retry
-middleware, the per-domain concurrency slots and the download timeout are all
-downloader-level features. Going through the engine keeps one traffic policy for
-the whole run. The cost is that ``process_item`` must be a coroutine, which
-requires the asyncio reactor -- already set in ``scrapy_settings.py``.
-
-Requirement 9 and HTTP conditional requests
--------------------------------------------
-Requirement 9 asks for two things that cannot both hold literally: do not
-re-download unchanged files, *and* use the file hash to detect changes. A hash
-requires the bytes.
-
-The way out is to let the server answer the question. Each download stores the
-response's ``ETag`` and ``Last-Modified``; the next run sends them back as
-``If-None-Match`` / ``If-Modified-Since``, and a **304 Not Modified** means
-unchanged with no body transferred. When the server offers no validator we fall
-back to downloading and comparing hashes, which still avoids a re-upload and a
-duplicate record -- the fallback is weaker on bandwidth but identical on
-correctness, and the hash remains the authority either way.
 """
 
 from __future__ import annotations
@@ -97,11 +57,6 @@ class DocumentDownloadPipeline:
     # ------------------------------------------------------------------ #
     def open_spider(self, spider: Any) -> None:
         """Prepare storage before the first item arrives.
-
-        Both calls are idempotent, and both are here rather than in a setup
-        script so that a fresh checkout plus ``docker compose up`` is enough to
-        run the crawl. Failing here -- before any traffic -- is also much kinder
-        than discovering a missing bucket 400 documents in.
         """
         mongo.ensure_indexes(self.cfg)
         store.ensure_buckets(self.cfg)
@@ -123,10 +78,6 @@ class DocumentDownloadPipeline:
 
     def close_spider(self, spider: Any) -> None:
         """Close the run document with the aggregated totals (requirement 10).
-
-        The spider's ``closed()`` emits the same numbers to the logs; this
-        persists them, so "how did last Tuesday's run go?" is a query rather than
-        an exercise in log archaeology.
         """
         totals = {
             "records_found": 0,
@@ -140,10 +91,6 @@ class DocumentDownloadPipeline:
             "listings_unaccounted": 0,
             "records_unaccounted": 0,
         }
-        # Per-partition completeness, measured against the store rather than
-        # against this pass. A pass that missed 8 records is not a problem if a
-        # previous pass already stored them, and re-running until complete
-        # converges precisely because the two questions are separate.
         partitions_incomplete: list[str] = []
         records_in_store = 0
 

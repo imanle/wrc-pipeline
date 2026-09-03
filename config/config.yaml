@@ -1,8 +1,3 @@
-# Single source of truth for every tunable in the pipeline.
-#
-# `${VAR:-default}` placeholders are expanded at load time (see settings.py), so
-# any value below can be overridden by an environment variable without this file
-# needing to know about it. Secrets belong in .env, never here.
 
 mongo:
   uri: "${MONGO_URI:-mongodb://wrc:wrc_password@localhost:27017/?authSource=admin}"
@@ -32,72 +27,21 @@ s3:
 partitions:
   # daily | weekly | monthly | quarterly | yearly
   #
-  # WEEKLY, chosen empirically rather than a priori. Monthly was the first choice
-  # -- 12 partitions a year, each comfortably sized -- but a live run over
-  # January 2024 exposed why it is wrong here:
-  #
-  #   The site paginates by offset (&pageNumber=N), and 234 results at 10 per
-  #   page is 24 pages, all requested concurrently. The server computes each page
-  #   against the result set at the moment that request arrives, and with 234
-  #   rows sharing only ~20 distinct dates, ties at page boundaries are not
-  #   deterministically ordered. Result: 6 records were served on two pages each
-  #   while 6 others appeared on none. 228 distinct records for a stated 234.
-  #
-  # Weekly cuts January into ~5 partitions of ~50 records, so ~6 pages each
-  # instead of 24 -- far fewer boundaries per concurrent request set. It does not
-  # eliminate drift, which is why the reconciliation check now counts DISTINCT
-  # records (see logging_config.PartitionCounters): a partition that loses a
-  # record fails loudly and gets re-run, and re-running is cheap because the
-  # pipeline is idempotent.
-  #
-  # Cost: ~5x the search requests for the same document count. Document fetches,
-  # which dominate the run, are unchanged.
+  # WEEKLY, chosen empirically rather than a priori.
   size: "${PARTITION_SIZE:-weekly}"
   start_date: "${RUN_START_DATE:-2024-01-01}"
   end_date: "${RUN_END_DATE:-2025-01-01}"
 
 scraping:
   base_url: "https://www.workplacerelations.ie"
-  # Confirmed stateless GET (Phase 0 recon). The site is ASP.NET WebForms and the
-  # search submits as a POST, but the server reflects all filter state into the
-  # query string and the resulting URL is reachable with no session cookie and no
-  # __VIEWSTATE -- verified in a clean incognito window. That means every
-  # (body, partition, page) tuple is an independent request, so the crawl is
-  # fully parallelisable and resumable. See ARCHITECTURE.md.
   #
   # Contract:
   #   /en/search/?decisions=1&from=<d/M/yyyy>&to=<d/M/yyyy>&body=<id>[&q=<kw>]
-  #
-  # `from`/`to` take UNPADDED day and month (18/8/2026, not 18/08/2026) whereas
-  # results are DISPLAYED zero-padded (20/08/2026). Two distinct formats; see
-  # format_input_date() / date_display_format below.
   search_path: "${SEARCH_PATH:-/en/search/}"
   # Constant flag scoping the search to the decisions database.
   decisions_flag: 1
   date_display_format: "%d/%m/%Y"
-  # NOTE: the site also accepts comma-joined bodies (&body=2,1,3,15376), but we
-  # deliberately issue one request per body so that partitions stay at
-  # (body x period) granularity -- retries, counters and Dagster partition keys
-  # all key off that tuple. See ARCHITECTURE.md.
-  # Confirmed against a live results page (Phase 0 recon). One record is:
-  #
-  #   <li class="each-item clearfix">
-  #     <h2 class="title" title="IR - SC - 00000787">
-  #       <a href="/en/cases/2024/january/ir- sc- 00000787.html">...</a></h2>
-  #     <span class="date">31/01/2024</span>
-  #     <p class="fullpath" title="/en/cases/2024/january/ir- sc- 00000787.html"></p>
-  #     <p class="description" title="Office Administrator V A Translation Service">...</p>
-  #     <span class="refNO">IR - SC - 00000787</span>
-  #     <div class="col-sm-3 link"><a href="...">View Page</a></div>
-  #   </li>
-  #
-  # Attributes are preferred over text nodes: `p.description@title` carries the
-  # untruncated value and needs no whitespace normalisation.
-  #
-  # NOTE: the identifier appears THREE times (h2.title@title, the anchor text,
-  # and span.refNO). Cross-checking them is a free integrity test -- if they
-  # disagree, our parse has drifted from the DOM and the record should fail
-  # loudly rather than be written with a wrong reference.
+
   listing:
     record: "li.each-item"
     identifier: "h2.title::attr(title)"
@@ -108,55 +52,21 @@ scraping:
     document_link_fallback: "p.fullpath::attr(title)"
 
   # CRITICAL: always follow the site's own href. NEVER rebuild a document URL
-  # from the identifier. Three incompatible manglings were observed:
-  #
-  #   IR - SC - 00000787   -> /en/cases/2024/january/ir- sc- 00000787.html
-  #                           (literal spaces after the hyphens!)
-  #   EDA2471              -> /en/cases/2024/december/eda2471.html
-  #   RP2147/2009 + 2 more -> /en/cases/2010/december/rp2147_2009_mn1794_2009_wt796_2009.html
-  #                           (three case refs concatenated into one filename)
-  #
-  # No rule derives these. The obvious optimisation of skipping the listing and
-  # constructing URLs from references would fail on entire bodies.
-
-  # Recon also found: every document sampled is .html (3 bodies, 2010-2024, no
-  # PDFs). The PDF branch of requirement 6a is implemented and unit tested
-  # against a synthetic file but is not exercised by live data in this range.
-  # Extension is taken from the resolved URL and cross-checked against the
-  # response Content-Type.
+  # from the identifier. 
   document_extensions:
     html: [".html", ".htm", ".aspx"]
     binary: [".pdf", ".doc", ".docx", ".rtf"]
 
-  # Employment Appeals Tribunal decisions are PDFs behind a WRAPPER page: the
-  # listing links to an .html page whose only content is a download link, 796
-  # characters of which is cookie banner and site chrome. Confirmed against a
-  # live 2012 month -- all 216 records are like this, and all 216 came out of the
-  # transformation flagged `thin_content`, which is how it was found.
-  #
-  # Scoped to `div.col-sm-9` deliberately. Three .pdf links exist on the page;
-  # the other two are `cookie_policy.pdf` and `Decisions_Information_Guide.pdf`
-  # in the header and footer. Only the real document sits inside the content
-  # column, so an unscoped `a[href$='.pdf']` would happily store the cookie
-  # policy 216 times.
   document_pdf_link: "${DOCUMENT_PDF_LINK:-div.col-sm-9 a[href$='.pdf']}"
 
   # Confirmed: &pageNumber=2 (1-based; omitted entirely for page 1).
   page_param: "${SEARCH_PAGE_PARAM:-pageNumber}"
-  # Fixed by the site, 10 results per page. Used with the "of N results"
-  # count to derive the total page count up front, so pages 2..N can be
-  # requested in parallel instead of crawled one "next" link at a time.
+
   page_size: 10
   # Regex over "Shows 1 to 10 of 234 results". Group 3 is the reconciliation
   # baseline for records_found (requirement 10).
   result_count_pattern: "Shows\\s+(\\d+)\\s+to\\s+(\\d+)\\s+of\\s+([\\d,]+)\\s+results"
-  # An empty search renders this INSTEAD of the count line (confirmed against
-  # &body=2 for a 2024 week: zero `li.each-item` blocks, no "Shows ... of N").
-  # Matching it positively means an empty partition reports records_found: 0 and
-  # succeeds, while a page whose count we simply cannot read still fails hard --
-  # the two must not collapse into each other.
   no_results_pattern: "There are no search results"
-  # Guard against a runaway pager if the count text ever fails to parse.
   max_pages_per_partition: ${MAX_PAGES_PER_PARTITION:-500}
   user_agent: "${SCRAPY_USER_AGENT:-wrc-research-crawler/1.0 (+contact: you@example.com)}"
   concurrent_requests: ${SCRAPY_CONCURRENT_REQUESTS:-16}
@@ -171,24 +81,6 @@ scraping:
   retry_http_codes: [429, 500, 502, 503, 504, 408, 522, 524]
   robotstxt_obey: false  # Documented decision; see ARCHITECTURE.md.
 
-  # The four tribunals from the left-hand "Body" facet.
-  #
-  # `value`         - the integer submitted as `&body=<value>`. Confirmed during
-  #                   Phase 0 recon by reading the checkbox `value` attributes
-  #                   (name="ctl00$ContentPlaceHolder_Main$CB2$CB2_n") and
-  #                   verifying each against the identifier prefix it returns.
-  #                   These are the site's own database keys, not an ordered
-  #                   enum -- note WRC is 15376 -- so they cannot be derived and
-  #                   must not be guessed.
-  # `earliest_date` - start of this body's coverage, per the official "Guide to
-  #                   Searching the Decisions and Determinations Database".
-  #                   Partitions ending before this date are skipped, so a zero
-  #                   result count always means "genuinely empty", never
-  #                   "we queried a period that cannot contain data".
-  # `identifier_pattern` - sanity check on the scraped reference. A selector that
-  #                   silently breaks after a site tweak produces None or page
-  #                   chrome; this turns that into a logged, countable failure
-  #                   instead of 800 corrupt records.
   bodies:
     - name: "Workplace Relations Commission"
       slug: "wrc"
@@ -212,90 +104,27 @@ scraping:
       slug: "employment-appeals-tribunal"
       value: "2"
       earliest_date: "2007-01-01"
-      # Statutory references, and often SEVERAL for one decision. Deliberately
-      # tolerant, because the site's own data entry is not: a live 2012 month
-      # (216 records) contained all of these forms --
-      #
-      #   RP1677/2009                             one reference
-      #   RP1105/2008, MN1197/2008, WT527/2008    several, comma-separated
-      #   UD365/2010 ,RP2819/2009                 space BEFORE the comma
-      #   UD1411/2010   RP1907/2010               no comma at all
-      #   RP1786/10                               two-digit year
-      #   ...WT551/201                            truncated year (typo)
-      #   UD462//2010                             double slash (typo)
-      #
-      # Hence `/{1,2}`, `[0-9]{2,4}` for the year and `[\s,]+` between
-      # references. Rejecting a real decision over the site's typo loses data,
-      # and the check's actual job -- catching a selector that has started
-      # returning navigation text -- is unaffected: "Ref no:", "View Page" and
-      # the numeric case number all still fail.
-      identifier_pattern: "(?i)^[A-Z]{2,3}[0-9]+/{1,2}[0-9]{2,4}([\\s,]+[A-Z]{2,3}[0-9]+/{1,2}[0-9]{2,4})*$"
-      # The title attribute and span.refNO are DIFFERENT identifiers here: the
-      # title holds the references above, refNO a numeric case number ("34007")
-      # shared across a group of claims -- one value appeared against 14 records
-      # in a sampled month. Comparing them failed all 216 records.
+      identifier_pattern: "(?i)^(?=[A-Z0-9\\s,/.-]*[A-Z])(?=[A-Z0-9\\s,/.-]*[0-9])[A-Z0-9][A-Z0-9\\s,/.-]*$"
+
       crosscheck_identifier: false
 
-  # Per-request noise, stripped before computing the CONTENT hash used for change
-  # detection and for the landing object key. The stored file is never modified.
-  #
-  # Confirmed on the first live run: every WRC page ends with an ASP.NET render
-  # timer, e.g. `<!-- Elapsed time: 0.046756 -->`. It differs on every fetch, so
-  # a raw byte hash made all 234 January documents look amended on the second
-  # run -- 234 spurious uploads and 234 spurious `versions` entries.
   volatile_content_patterns:
     - "<!--\\s*Elapsed time:[^>]*-->"
 
-  # Labour Court and Equality Tribunal references contain forward slashes
-  # (e.g. CD/12/572, EE/2006/040). The brief requires files be renamed to
-  # `identifier.ext`, and a raw slash would either create an accidental S3
-  # prefix or fail outright on a local filesystem. We therefore keep the raw
-  # `identifier` for fidelity and derive `identifier_safe` for object keys.
-  # The Equality Tribunal's listing appends " - Full Case Report" to the title
-  # attribute; the other bodies append nothing. Stripped before the identifier is
-  # cross-checked or validated, because it is presentation rather than identity.
-  # `\s*` on both sides of the dash: one sampled record had no leading space.
   identifier_strip_patterns:
     - "\\s*-\\s*Full Case Report\\s*$"
-
-  # Comma included for the Employment Appeals Tribunal's multi-reference
-  # identifiers, which would otherwise carry commas into object keys.
   identifier_unsafe_chars: "/\\\\:*?\"<>| ,"
   identifier_replacement: "-"
 
 transform:
-  # Confirmed against a live decision page (Phase 0 recon). Structure is:
-  #
-  #   body#b > div#search
-  #     header                      <- cookie bar, language switch, logos
-  #     div.container.searchbanner  <- site-wide blurb
-  #     div.container.mb-4 > div.container > div.row
-  #       div.col-sm-3              <- "Return to Search"
-  #       div.col-sm-9
-  #         h1.page-title           <- identifier, e.g. "EDA2471"   KEEP
-  #         div.content             <- the determination itself     KEEP
-  #     footer
-  #
-  # WHITELIST, not blacklist. We extract only the elements below and discard the
-  # rest of the document. A blacklist that strips nav/header/footer would still
-  # leak anything the site adds later (survey banners, promos, the "Add To My
-  # Documents" binder, the Google Translate widget). Selecting the content
-  # positively means unknown chrome is excluded by construction.
-  #
-  # Tried in order; the first selector that matches is used. Multiple entries
-  # exist for resilience across bodies, not because we saw them all.
   content_selectors:
     - "div.content"
     - "div.col-sm-9"
     - "main"
     - "article"
-  # Prepended to the extracted content when present, so the cleaned file keeps
-  # the identifier heading shown at the top of the boxed region in the brief.
+
   title_selector: "h1.page-title"
 
-  # Second pass, applied INSIDE the whitelisted content. `div.content` really
-  # does contain a <script> block, a decorative letterhead image, and 1x1
-  # ecblank.gif spacer GIFs inside the signature table.
   strip_selectors:
     - "script"
     - "style"
@@ -306,19 +135,13 @@ transform:
     - "img[src*='ecblank']"
     - "img[width='1'][height='1']"
 
-  # Explicitly NOT stripped: div.table-responsive and its tables. They carry the
-  # parties, the court division and the signature block -- substantive content
-  # that a generic boilerplate remover would discard as layout.
+
   preserve_selectors:
     - "table"
     - "div.table-responsive"
 
-  # Drop elements left empty after stripping (the source has many bare <p></p>).
   drop_empty_elements: true
-  # Collapse &nbsp; and repeated whitespace, which the source uses for spacing.
   normalise_whitespace: true
-  # Below this, the extraction almost certainly grabbed the wrong node. Flagged
-  # for review rather than silently written.
   min_content_chars: 200
 
 logging:

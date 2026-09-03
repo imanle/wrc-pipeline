@@ -4,21 +4,6 @@ Pure functions: bytes in, bytes out, no MongoDB, no object storage, no network.
 Everything hard about this stage lives here, which means it can be tested against
 fixture HTML directly and the runner is left with nothing but plumbing.
 
-Whitelist, not blacklist
-------------------------
-The brief asks for "only the relevant content of the document (excluding
-navigation bars/buttons, headers, footers, etc.)". Two ways to get there:
-
-* strip the chrome you know about -- ``header``, ``footer``, ``nav``;
-* select the content you want and discard everything else.
-
-The second is chosen. A blacklist only removes what it has been told about, so
-the day the site adds a survey banner, a cookie notice or a "Add To My
-Documents" widget, that text silently lands in the curated corpus. Selecting
-``div.content`` positively means unknown chrome is excluded by construction --
-the failure mode becomes "we extracted too little", which ``min_content_chars``
-catches, rather than "we extracted junk", which nothing catches.
-
 Three passes, in order
 ----------------------
 1. **Select** the content root: the first of ``content_selectors`` that matches.
@@ -43,19 +28,12 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 
 from ..settings import Settings, TransformSettings, get_settings
 
-# Bumping this forces every document to be re-transformed on the next run, even
-# when its source bytes are unchanged. That is the point: improved cleaning logic
-# has to be able to take effect, and the alternative -- manually clearing the
-# curated zone -- is a step someone will forget.
+
 CLEANER_VERSION = "1"
 
-# Elements that are meaningful even with no text: a table cell holding a blank in
-# the parties grid is data ("Anonymised Parties" with an empty Employer column),
-# and dropping it shifts every column after it.
+
 NEVER_EMPTY_PRUNED = {"td", "th", "tr", "table", "thead", "tbody", "br", "hr", "img"}
 
-# &nbsp; and friends. The source uses non-breaking spaces for layout, so party
-# names arrive as "Sarah\xa0McGuirk" and a search for "Sarah McGuirk" misses.
 _WHITESPACE_RUN = re.compile(r"[\s\u00a0\u2007\u202f]+")
 
 
@@ -74,8 +52,6 @@ class CleanedDocument:
     @property
     def is_thin(self) -> bool:
         """Whether the extraction looks too small to be a real decision.
-
-        Not an error by itself -- see ``quality_flag`` handling in the runner.
         """
         return self.text_chars < 200
 
@@ -83,14 +59,12 @@ class CleanedDocument:
 def _matches_any(element: Tag, selectors: list[str]) -> bool:
     """Whether *element* itself matches any of *selectors*.
 
-    Uses the element's own soup to run the selector and checks membership, since
-    BeautifulSoup has no "does this node match" primitive.
     """
     for selector in selectors:
         try:
             if element in element.parent.select(selector) if element.parent else False:
                 return True
-        except Exception:  # noqa: BLE001 -- a bad selector must not kill the run
+        except Exception: 
             continue
     return False
 
@@ -108,10 +82,6 @@ def _is_inside(element: Tag, roots: list[Tag]) -> bool:
 
 def _normalise_whitespace(root: Tag) -> None:
     """Collapse whitespace runs in text nodes, in place.
-
-    Operates on text nodes rather than on the serialised HTML: rewriting the
-    whole string would also touch attribute values and tag structure, and the
-    goal is only that "Sarah\\xa0McGuirk" becomes searchable as "Sarah McGuirk".
     """
     for text in list(root.find_all(string=True)):
         if isinstance(text, NavigableString):
@@ -123,9 +93,6 @@ def _normalise_whitespace(root: Tag) -> None:
 def _prune_empty(root: Tag, preserved: list[Tag]) -> int:
     """Remove elements with no text and no meaningful children.
 
-    Iterates until nothing changes, because emptying a child can leave its parent
-    empty -- the source is full of nested ``<p><span></span></p>`` spacing. Skips
-    anything inside *preserved*, and anything whose tag is structural.
     """
     removed = 0
     changed = True

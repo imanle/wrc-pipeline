@@ -1,34 +1,4 @@
 """MongoDB access layer.
-
-Owns every read and write of pipeline metadata. Nothing else in the project
-should import ``pymongo`` directly -- keeping the driver behind this module means
-the spider, the transformation stage and the Dagster assets all agree on the
-document shape, and swapping the store later is a single-file change.
-
-Idempotency 
----------------------------
-The obvious implementation of "don't create duplicates" is a read-then-write::
-
-    if collection.find_one({"identifier": ident}) is None:
-        collection.insert_one(record)
-
-That is a race. Two workers can both read "absent" before either writes, and both
-then insert. With partitions running concurrently this is the expected case, not
-a rare one.
-
-So the guarantee lives in the database as a **unique compound index** on
-``(body, identifier)``, and every write is a single atomic ``update_one(...,
-upsert=True)``. MongoDB physically refuses a second record for the same decision
-regardless of what the application does. A code-level check is a convention; an
-index is an invariant.
-
-Landing-zone immutability
--------------------------
-The brief forbids deleting or updating landing-zone data. Fields that describe
-the document *as first seen* are written with ``$setOnInsert`` and never touched
-again. Only run-tracking fields are refreshed. When a document's content changes
-between runs we append to a ``versions`` array and the new file lands at a new
-object key (keys carry a hash suffix), so nothing is ever overwritten.
 """
 
 from __future__ import annotations
@@ -51,10 +21,6 @@ log = get_logger(__name__)
 
 class WriteOutcome(str, Enum):
     """What a save actually did.
-
-    Returned by :func:`upsert_landing_record` so idempotency is *observable*
-    rather than merely asserted: a second run over the same date range should
-    report ``UNCHANGED`` for every record, and that is the proof.
     """
 
     INSERTED = "inserted"    # first time we have seen this record
@@ -63,11 +29,6 @@ class WriteOutcome(str, Enum):
 
 
 def _utcnow() -> datetime:
-    """Timezone-aware UTC timestamp.
-
-    Always UTC: the pipeline may run in one region against data from another,
-    and naive local timestamps make cross-run comparison unreliable.
-    """
     return datetime.now(tz=timezone.utc)
 
 
@@ -77,21 +38,6 @@ def _utcnow() -> datetime:
 @functools.lru_cache(maxsize=4)
 def _build_client(uri: str, timeout_ms: int) -> MongoClient:
     """Create and verify a client, cached per connection string.
-
-    Cached because ``MongoClient`` is thread-safe and maintains its own
-    connection pool internally. Creating one per record -- a common mistake --
-    exhausts server connections quickly and is far slower.
-
-    Note the cache key is the URI and timeout, **not** a ``Settings`` object.
-    ``lru_cache`` requires hashable arguments, and ``Settings`` contains lists
-    (``bodies``, ``retry_http_codes``) so it is unhashable; caching on it raises
-    ``TypeError: unhashable type``. Keying on the primitive values is also more
-    honest -- two different Settings objects with the same URI *should* share a
-    connection pool.
-
-    Also pings on creation. PyMongo connects lazily, so a wrong URI or bad
-    credentials would otherwise stay silent until the first write, potentially
-    thousands of requests into a crawl. Failing here makes it immediate.
     """
     client: MongoClient = MongoClient(
         uri,
@@ -145,10 +91,6 @@ def failures_collection(settings: Settings | None = None) -> Collection:
 # --------------------------------------------------------------------------- #
 def ensure_indexes(settings: Settings | None = None) -> None:
     """Create every index the pipeline relies on. Safe to call repeatedly.
-
-    ``create_index`` is idempotent in MongoDB -- creating an index that already
-    exists with the same definition is a no-op -- so this runs at the start of
-    every pipeline run rather than as a separate migration step.
     """
     settings = settings or get_settings()
     landing = landing_collection(settings)
@@ -163,7 +105,7 @@ def ensure_indexes(settings: Settings | None = None) -> None:
         unique=True,
         name="uniq_body_identifier",
     )
-    # How the spider's reconciliation and the transform stage filter their work.
+
     landing.create_index(
         [("body_slug", ASCENDING), ("partition_key", ASCENDING)],
         name="body_partition",
@@ -198,19 +140,9 @@ def find_existing(
     settings: Settings | None = None,
 ) -> dict[str, Any] | None:
     """Fetch a landing record if we already hold it.
-
-    Used for change detection *before* downloading: if the record exists and the
-    remote file still hashes to the stored value, the download is skipped
-    entirely. Projection limits the fields returned because this runs once per
-    record and we only need the hash and path.
     """
     return landing_collection(settings).find_one(
         {"body_slug": body_slug, "identifier": identifier},
-        # Every field the download pipeline needs before fetching: the hashes for
-        # change detection, the path to carry forward on a skip, and the HTTP
-        # validators for a conditional request. Omitting a field here silently
-        # disables the feature that reads it -- etag/last_modified were missing
-        # at first, which made conditional requests dead code.
         projection={
             "file_hash": 1,
             "content_hash": 1,
@@ -228,12 +160,6 @@ def count_partition_records(
     settings: Settings | None = None,
 ) -> int:
     """How many distinct decisions we hold for one (body, partition).
-
-    The store, not the run. A single pass can miss records the previous pass
-    already captured -- this source's page windows overlap and displace entries
-    non-deterministically -- so "did this pass see all 234?" and "do we hold all
-    234?" are different questions, and only the second one decides whether the
-    partition needs re-running.
     """
     return landing_collection(settings).count_documents(
         {"body_slug": body_slug, "partition_key": partition_key}
@@ -259,15 +185,6 @@ def upsert_landing_record(
     key = {"body_slug": record["body_slug"], "identifier": record["identifier"]}
     now = _utcnow()
 
-    # file_path is REQUIRED here, not optional: it is copied into the versions
-    # entry below, and a projection that omits it silently writes a null path for
-    # every superseded version -- the object survives in the bucket but nothing
-    # records where it is, which defeats the point of keeping history.
-    #
-    # This is the second bug of exactly this shape (find_existing omitted
-    # etag/last_modified, which made conditional requests dead code). A projection
-    # is a contract with the code below it: whenever you read a field from
-    # `existing`, check it is listed here.
     existing = collection.find_one(
         key,
         projection={"file_hash": 1, "file_path": 1, "content_hash": 1, "versions": 1},
@@ -275,8 +192,6 @@ def upsert_landing_record(
 
     # --- unchanged -------------------------------------------------------- #
     if existing and existing.get("file_hash") == record.get("file_hash"):
-        # Touch only run-tracking fields. The record itself is untouched, which
-        # is what "do not update the Landing Zone" means in practice.
         collection.update_one(
             key,
             {"$set": {"last_seen_at": now, "last_run_id": record.get("run_id")}},
@@ -285,9 +200,6 @@ def upsert_landing_record(
 
     # --- changed ---------------------------------------------------------- #
     if existing:
-        # Preserve the superseded state rather than discarding it. The file
-        # itself is also safe: object keys embed the hash, so the new download
-        # lands beside its predecessor rather than on top of it.
         previous_version = {
             "file_hash": existing.get("file_hash"),
             "file_path": existing.get("file_path"),
@@ -295,26 +207,6 @@ def upsert_landing_record(
             "superseded_at": now,
         }
 
-        # The version list is rebuilt rather than appended to, because content on
-        # this source does not only move forward.
-        #
-        # The WRC republishes some decisions under the same reference: the same
-        # case sits at /2024/january/adj-00044064.html and again at
-        # /2024/february/... with heavier anonymisation, and each week's search
-        # returns its own copy. So the "current" version flips back and forth
-        # depending on which partition ran last. An unconditional $push appended
-        # an entry on every flip -- four live passes produced four entries for two
-        # actual files, including one identical to the current version, and the
-        # array grew without limit.
-        #
-        # Two rules, which need the whole array rather than a $push:
-        #   1. a version already recorded is not recorded again;
-        #   2. the version that just became current is removed from the history,
-        #      since `versions` holds superseded states only.
-        #
-        # $addToSet cannot do (1) -- it compares whole subdocuments and
-        # superseded_at differs every time -- and (2) needs a $pull, which cannot
-        # share a field with a $push in one update.
         history = [
             v
             for v in (existing.get("versions") or [])
@@ -356,8 +248,6 @@ def upsert_landing_record(
         collection.update_one(
             key,
             {
-                # $setOnInsert fields describe the document as first seen and are
-                # never modified afterwards.
                 "$setOnInsert": {**record, "first_seen_at": now},
                 "$set": {"last_seen_at": now},
             },
@@ -365,9 +255,6 @@ def upsert_landing_record(
         )
         return WriteOutcome.INSERTED
     except DuplicateKeyError:
-        # A concurrent worker inserted the same record between our find_one and
-        # this upsert. The unique index did its job: the data is correct and the
-        # other worker owns the insert, so we report a no-op rather than failing.
         log.debug("record.insert_race", extra={"identifier": record["identifier"]})
         return WriteOutcome.UNCHANGED
 
@@ -379,10 +266,6 @@ def iter_landing_records(
     settings: Settings | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Stream landing records for a date range (the transformation stage's input).
-
-    A generator, not a list: at 1000x scale a month's metadata should not have
-    to fit in memory at once. ``$gte``/``$lte`` because partition windows are
-    inclusive at both ends, matching the site's own date filters.
     """
     query: dict[str, Any] = {
         "published_date": {
@@ -435,12 +318,6 @@ def record_failure(
     settings: Settings | None = None,
 ) -> None:
     """Persist one unscraped record with its reason.
-
-    Duplicates what the JSON logs already capture, deliberately. Logs answer
-    "what happened during this run"; a collection answers "show me every 404 we
-    have ever hit, grouped by body" -- a query you cannot run against text files.
-
-    Never raises: a failure while recording a failure must not abort the crawl.
     """
     try:
         failures_collection(settings).insert_one(
@@ -455,7 +332,7 @@ def record_failure(
                 "recorded_at": _utcnow(),
             }
         )
-    except Exception:  # noqa: BLE001 - see docstring
+    except Exception: 
         log.exception("mongo.failure_write_failed", extra={"url": url})
 
 
