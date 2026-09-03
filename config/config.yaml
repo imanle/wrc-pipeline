@@ -86,19 +86,19 @@ scraping:
       slug: "wrc"
       value: "15376"
       earliest_date: "2015-10-01"
-      identifier_pattern: "^(ADJ|IR)[- ]?.*"
+      identifier_pattern: "(?i)^(?=[A-Z0-9\\s,/.-]*[A-Z])(?=[A-Z0-9\\s,/.-]*[0-9])[A-Z0-9][A-Z0-9\\s,/.-]*$"
 
     - name: "Labour Court"
       slug: "labour-court"
       value: "3"
       earliest_date: "1986-10-01"
-      identifier_pattern: "^[A-Z]{2,4}[-/ ]?[0-9/]+$"
+      identifier_pattern: "(?i)^(?=[A-Z0-9\\s,/.-]*[A-Z])(?=[A-Z0-9\\s,/.-]*[0-9])[A-Z0-9][A-Z0-9\\s,/.-]*$"
 
     - name: "Equality Tribunal"
       slug: "equality-tribunal"
       value: "1"
       earliest_date: "1996-01-01"
-      identifier_pattern: "^(DEC-[A-Z][0-9]{4}-[0-9]+|[A-Z]{2}/[0-9]{4}/[0-9]+)$"
+      identifier_pattern: "(?i)^(?=[A-Z0-9\\s,/.-]*[A-Z])(?=[A-Z0-9\\s,/.-]*[0-9])[A-Z0-9][A-Z0-9\\s,/.-]*$"
 
     - name: "Employment Appeals Tribunal"
       slug: "employment-appeals-tribunal"

@@ -91,7 +91,12 @@ def generate_partitions(
     end_date: date,
     size: PartitionSize | str = PartitionSize.MONTHLY,
 ) -> Iterator[Partition]:
-    
+    """Walk ``[start_date, end_date]`` as consecutive, non-overlapping windows.
+
+    Each window's end is clamped to *end_date*, so the caller never asks the
+    source for dates outside the requested range even when the last window
+    would otherwise run past it.
+    """
     if isinstance(size, str):
         size = PartitionSize(size)
     if start_date > end_date:
@@ -115,7 +120,12 @@ def window_for(
     window_start: date,
     size: PartitionSize | str = PartitionSize.MONTHLY,
 ) -> Partition:
+    """Rebuild the single window that starts on *window_start*.
 
+    Unlike :func:`generate_partitions`, this does not clamp against a range
+    end -- it is how Dagster turns one partition key back into the window it
+    names, and a partition key always names a whole window.
+    """
     if isinstance(size, str):
         size = PartitionSize(size)
     return Partition(

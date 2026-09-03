@@ -279,7 +279,12 @@ class ScrapingSettings(BaseModel):
         return f"{base}?{urlencode(params, safe='/')}"
 
     def safe_identifier(self, identifier: str) -> str:
+        """Render an identifier fit for use as a path segment in an S3 key.
 
+        Runs after :meth:`clean_identifier`, which removes listing decorations;
+        this step only makes the result filesystem/URL-safe by replacing
+        characters a key template cannot contain.
+        """
         cleaned = identifier.strip()
         for char in self.identifier_unsafe_chars:
             cleaned = cleaned.replace(char, self.identifier_replacement)
